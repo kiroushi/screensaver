@@ -18,6 +18,16 @@ const WARP: f32 = 3.5;
 const OCTAVES_Q: usize = 2;
 const OCTAVES_R: usize = 3;
 const OCTAVES_F: usize = 8;
+/// The first octaves of `f`, which are drawn at every other sample when a keyframe is
+/// supersampled. Their lattice cells are at least 52 samples wide before the warp, so the cubic
+/// between samples misses them by far less than the width of a mass edge.
+const COARSE_OCTAVES: usize = 6;
+const FINE_OCTAVES: usize = OCTAVES_F - COARSE_OCTAVES;
+/// Widest spacing of the warp nodes in screen heights. It is the spacing of the reference at
+/// 480x203, and twice that fails the parity check against it.
+const WARP_SPACING: f64 = 2.0 / 203.0;
+/// Warp node rows kept, which covers the rows of a sample row and of the coarse rows around it.
+const WARP_ROWS: usize = 8;
 const LACUNARITY: f32 = 2.02;
 const Q_OFFSET: [f32; 2] = [5.2, 1.3];
 const RX_OFFSET: [f32; 2] = [1.7, 9.2];
@@ -244,6 +254,17 @@ fn channel_byte(value: f32) -> u32 {
     floor.to_bits() & 0xff
 }
 
+/// The value between `b` and `c` on the cubic through `a`, `b`, `c` and `d` at equal spacing,
+/// with the given weights. Halfway it is the [`midpoint`], which the reference uses.
+#[inline(always)]
+fn between(halfway: bool, weights: [f32; 4], a: f32, b: f32, c: f32, d: f32) -> f32 {
+    if halfway {
+        midpoint(a, b, c, d)
+    } else {
+        weights[0] * a + weights[1] * b + weights[2] * c + weights[3] * d
+    }
+}
+
 fn lanes(values: &[f32]) -> &Lanes {
     values.try_into().expect("a chunk is LANES long")
 }
@@ -252,8 +273,8 @@ fn lanes_mut(values: &mut [f32]) -> &mut Lanes {
     values.try_into().expect("a chunk is LANES long")
 }
 
-/// The warp vectors `qx`, `qy`, `rx` and `ry` at every other column of one even row. Node `i`
-/// sits at column `2 * i - 2`, so the nodes reach two columns past both edges.
+/// The warp vectors `qx`, `qy`, `rx` and `ry` at every `grid` columns of one row. Node `i` sits
+/// at column `grid * (i - 1)`, so the nodes reach past both edges.
 struct WarpRow {
     row: isize,
     values: [Vec<f32>; 4],
@@ -311,9 +332,15 @@ impl Prefilter {
             for (i, padded) in self.padded.iter_mut().enumerate() {
                 *padded = light[i.saturating_sub(reach).min(last)].clamp(0.0, 1.0);
             }
-            for (j, out) in row.iter_mut().enumerate() {
-                let window = &self.padded[SUPERSAMPLE * j..][..TAPS];
-                *out = window.iter().zip(PREFILTER).map(|(v, w)| v * w).sum();
+            // The weights are the same from both ends, so each one multiplies a sum of two
+            // samples. Walking the row in pairs lets the loop vectorize.
+            let (pairs, _) = self.padded.as_chunks::<SUPERSAMPLE>();
+            let [outer, middle, inner, ..] = PREFILTER;
+            for (out, ((a, b), c)) in row
+                .iter_mut()
+                .zip(pairs.iter().zip(&pairs[1..]).zip(&pairs[2..]))
+            {
+                *out = outer * (a[0] + c[1]) + middle * (a[1] + c[0]) + inner * (b[0] + b[1]);
             }
         }
         self.pushed += 1;
@@ -330,6 +357,42 @@ impl Prefilter {
                     *out += value * weight;
                 }
             }
+        }
+    }
+}
+
+/// The coarse octaves of `f` at every other column of one even sample row. Node `i` sits at
+/// column `2 * i - 2`.
+struct CoarseRow {
+    row: isize,
+    values: Vec<f32>,
+}
+
+/// The coarse octaves of `f`, drawn at every other sample of every other row.
+struct Coarse {
+    /// Coarse rows by row index modulo 4. Row `k` is sample row `2 * k`.
+    rows: [CoarseRow; 4],
+    /// The warp vectors `rx` and `ry` at every other column of the coarse row being drawn.
+    warps: [Vec<f32>; 2],
+    /// Coarse rows blended for an odd sample row.
+    blend: Vec<f32>,
+    /// The coarse octaves at every sample of the row being computed.
+    values: Vec<f32>,
+    /// The turn and scale that the coarse octaves apply to a position, as a complex factor.
+    turn: [f32; 2],
+    /// Amplitude of the first fine octave relative to the first octave.
+    gain: f32,
+}
+
+/// Writes every `step`th sample of a row from its nodes, which sit `cubic.len()` samples apart.
+fn spread(nodes: &[f32], out: &mut [f32], cubic: &[[f32; 4]], step: usize) {
+    let grid = cubic.len();
+    for (m, group) in out.chunks_exact_mut(grid / step).enumerate() {
+        let (a, b, c, d) = (nodes[m], nodes[m + 1], nodes[m + 2], nodes[m + 3]);
+        group[0] = b;
+        for (index, out) in group.iter_mut().enumerate().skip(1) {
+            let phase = index * step;
+            *out = between(2 * phase == grid, cubic[phase], a, b, c, d);
         }
     }
 }
@@ -353,9 +416,11 @@ struct Star {
 
 /// Draws a keyframe into a buffer row by row, so the work can be spread across frames.
 ///
-/// The warp vectors vary slowly, so they are evaluated at every other row and column and the
-/// samples between take a cubic midpoint. Everything else is evaluated at every sample. A
-/// [`Prefilter`] turns the samples into buffer pixels when there are more samples than pixels.
+/// The warp vectors vary slowly, so they are evaluated at nodes several samples apart and the
+/// samples between lie on the cubic through the four nearest nodes. A supersampled keyframe
+/// draws the coarse octaves of `f` the same way at every other sample. Everything else is
+/// evaluated at every sample. A [`Prefilter`] turns the samples into buffer pixels when there
+/// are more samples than pixels.
 pub struct Raster {
     /// Samples per row.
     width: usize,
@@ -375,8 +440,13 @@ pub struct Raster {
     node_columns: Vec<f32>,
     /// Factor from a difference of `f` across one pixel to the shading slope.
     slope: f32,
-    /// Warp node rows by row index modulo 4.
-    warp_rows: [WarpRow; 4],
+    /// Samples between two warp nodes along each axis.
+    grid: usize,
+    /// Weights of the four nearest nodes for each sample between two nodes.
+    cubic: Vec<[f32; 4]>,
+    coarse: Option<Coarse>,
+    /// Warp node rows by row index modulo [`WARP_ROWS`].
+    warp_rows: [WarpRow; WARP_ROWS],
     /// Warp node values blended between node rows for an odd pixel row.
     blend: [Vec<f32>; 4],
     /// Warp vectors at every pixel of the row being computed.
@@ -398,6 +468,8 @@ pub struct Raster {
     density: Vec<f32>,
     /// Luminance, rim and glow of the row being shaded.
     factors: [Vec<f32>; 3],
+    /// How far the row being shaded has moved from each palette stop to the next.
+    blends: [Vec<f32>; STOPS.len() - 1],
 }
 
 impl Raster {
@@ -421,11 +493,54 @@ impl Raster {
         let (width, height, stride) = (width * samples, height * samples, out_stride * samples);
         // Screen pixels per sample.
         let step = scale / samples as f64;
-        let nodes = (stride / 2 + 4).div_ceil(LANES) * LANES;
+        // A keyframe drawn one sample per screen pixel keeps the reference's node spacing.
+        let grid = if samples > 1 {
+            let widest = WARP_SPACING * f64::from(screen_height) / step;
+            [8, 4]
+                .into_iter()
+                .find(|&grid| grid as f64 <= widest)
+                .unwrap_or(2)
+        } else {
+            2
+        };
+        let cubic = (0..grid)
+            .map(|phase| {
+                let t = phase as f64 / grid as f64;
+                [
+                    -t * (t - 1.0) * (t - 2.0) / 6.0,
+                    (t + 1.0) * (t - 1.0) * (t - 2.0) / 2.0,
+                    -(t + 1.0) * t * (t - 2.0) / 2.0,
+                    (t + 1.0) * t * (t - 1.0) / 6.0,
+                ]
+                .map(|w| w as f32)
+            })
+            .collect();
+        let coarse = (samples > 1).then(|| {
+            let mut turn = [1.0f64, 0.0];
+            for _ in 0..COARSE_OCTAVES {
+                let lacunarity = f64::from(LACUNARITY);
+                turn = [
+                    (0.8 * turn[0] - 0.6 * turn[1]) * lacunarity,
+                    (0.6 * turn[0] + 0.8 * turn[1]) * lacunarity,
+                ];
+            }
+            Coarse {
+                rows: std::array::from_fn(|_| CoarseRow {
+                    row: isize::MIN,
+                    values: vec![0.0; stride / 2 + 3],
+                }),
+                warps: std::array::from_fn(|_| vec![0.0; stride / 2]),
+                blend: vec![0.0; stride / 2 + 3],
+                values: vec![0.0; stride],
+                turn: turn.map(|t| t as f32),
+                gain: 0.5f32.powi(COARSE_OCTAVES as i32),
+            }
+        });
+        let nodes = (stride / grid + 4).div_ceil(LANES) * LANES;
         let units_per_pixel = (FIELD_HEIGHT * step / f64::from(screen_height)) as f32;
         let columns = (0..stride).map(|x| x as f32 * units_per_pixel).collect();
         let node_columns = (0..nodes)
-            .map(|i| (2 * i as i32 - 2) as f32 * units_per_pixel)
+            .map(|i| ((i as i32 - 1) * grid as i32) as f32 * units_per_pixel)
             .collect();
         let warp_row = || WarpRow {
             row: isize::MIN,
@@ -493,6 +608,9 @@ impl Raster {
             columns,
             node_columns,
             slope: SHADE_SLOPE / units_per_pixel,
+            grid,
+            cubic,
+            coarse,
             warp_rows: std::array::from_fn(|_| warp_row()),
             blend: std::array::from_fn(|_| vec![0.0; nodes]),
             warps: std::array::from_fn(|_| vec![0.0; stride]),
@@ -509,6 +627,7 @@ impl Raster {
             light: std::array::from_fn(|_| vec![0.0; stride]),
             density: vec![0.0; stride],
             factors: std::array::from_fn(|_| vec![0.0; stride]),
+            blends: std::array::from_fn(|_| vec![0.0; stride]),
         }
     }
 
@@ -576,13 +695,13 @@ impl Raster {
 
     /// Makes sure node row `row` is in its slot of the ring.
     fn warp_row(&mut self, row: isize) {
-        let slot = &mut self.warp_rows[row.rem_euclid(4) as usize];
+        let slot = &mut self.warp_rows[row.rem_euclid(WARP_ROWS as isize) as usize];
         if slot.row == row {
             return;
         }
         slot.row = row;
         let (table, seed) = (self.table, self.seed);
-        let py = [(2 * row) as f32 * self.units_per_pixel; LANES];
+        let py = [(self.grid as isize * row) as f32 * self.units_per_pixel; LANES];
         let [qx_row, qy_row, rx_row, ry_row] = &mut slot.values;
         for (chunk, px) in self.node_columns.chunks_exact(LANES).enumerate() {
             let px = lanes(px);
@@ -613,36 +732,104 @@ impl Raster {
         }
     }
 
-    /// Fills the warp vectors of every pixel of row `y` from the node rows.
+    /// Fills `blend` with the warp nodes of sample row `y`, which may lie outside the keyframe.
+    fn blend_nodes(&mut self, y: isize) {
+        let grid = self.grid as isize;
+        let (row, phase) = (y.div_euclid(grid), y.rem_euclid(grid) as usize);
+        let slot = |k: isize| k.rem_euclid(WARP_ROWS as isize) as usize;
+        if phase == 0 {
+            self.warp_row(row);
+            for (blend, values) in self.blend.iter_mut().zip(&self.warp_rows[slot(row)].values) {
+                blend.copy_from_slice(values);
+            }
+            return;
+        }
+        for k in row - 1..=row + 2 {
+            self.warp_row(k);
+        }
+        let [a, b, c, d] = [row - 1, row, row + 1, row + 2].map(|k| &self.warp_rows[slot(k)]);
+        let (halfway, weights) = (2 * phase == self.grid, self.cubic[phase]);
+        for (q, blend) in self.blend.iter_mut().enumerate() {
+            let (a, b, c, d) = (&a.values[q], &b.values[q], &c.values[q], &d.values[q]);
+            for (i, out) in blend.iter_mut().enumerate() {
+                *out = between(halfway, weights, a[i], b[i], c[i], d[i]);
+            }
+        }
+    }
+
+    /// Fills the warp vectors of every sample of row `y` from the node rows.
     fn interpolate_warps(&mut self, y: usize) {
+        self.blend_nodes(y as isize);
+        for (nodes, warps) in self.blend.iter().zip(&mut self.warps) {
+            spread(nodes, warps, &self.cubic, 1);
+        }
+    }
+
+    /// Makes sure coarse row `row` is in its slot of the ring.
+    fn coarse_row(&mut self, coarse: &mut Coarse, row: isize) {
+        let slot = &mut coarse.rows[row.rem_euclid(4) as usize];
+        if slot.row == row {
+            return;
+        }
+        slot.row = row;
+        self.blend_nodes(2 * row);
+        for (nodes, warps) in self.blend[2..].iter().zip(&mut coarse.warps) {
+            spread(nodes, warps, &self.cubic, 2);
+        }
+        let (table, seed) = (self.table, self.seed);
+        let py = (2 * row) as f32 * self.units_per_pixel;
+        let [rx_row, ry_row] = &coarse.warps;
+        let half = rx_row.len();
+        for (((out, px), rx), ry) in slot.values[1..=half]
+            .chunks_exact_mut(LANES)
+            .zip(self.columns.chunks_exact(2 * LANES))
+            .zip(rx_row.chunks_exact(LANES))
+            .zip(ry_row.chunks_exact(LANES))
+        {
+            let f = fbm::<COARSE_OCTAVES>(
+                std::array::from_fn(|l| px[2 * l] + WARP * rx[l]),
+                std::array::from_fn(|l| py + WARP * ry[l]),
+                seed,
+                table,
+            );
+            out.copy_from_slice(&f);
+        }
+        // The nodes past the edges continue the line through the last two inside.
+        let values = &mut slot.values;
+        values[0] = 2.0 * values[1] - values[2];
+        values[half + 1] = 2.0 * values[half] - values[half - 1];
+        values[half + 2] = 3.0 * values[half] - 2.0 * values[half - 1];
+    }
+
+    /// Fills the coarse octaves of every sample of row `y` from the coarse rows.
+    fn interpolate_coarse(&mut self, coarse: &mut Coarse, y: usize) {
         let row = (y / 2) as isize;
         let nodes = if y.is_multiple_of(2) {
-            self.warp_row(row);
-            &self.warp_rows[row.rem_euclid(4) as usize].values
+            self.coarse_row(coarse, row);
+            &coarse.rows[row.rem_euclid(4) as usize].values
         } else {
             for k in row - 1..=row + 2 {
-                self.warp_row(k);
+                self.coarse_row(coarse, k);
             }
-            let [a, b, c, d] =
-                [row - 1, row, row + 1, row + 2].map(|k| &self.warp_rows[k.rem_euclid(4) as usize]);
-            for (q, blend) in self.blend.iter_mut().enumerate() {
-                let (a, b, c, d) = (&a.values[q], &b.values[q], &c.values[q], &d.values[q]);
-                for (i, out) in blend.iter_mut().enumerate() {
-                    *out = midpoint(a[i], b[i], c[i], d[i]);
-                }
+            let [a, b, c, d] = [row - 1, row, row + 1, row + 2]
+                .map(|k| &coarse.rows[k.rem_euclid(4) as usize].values);
+            for (i, out) in coarse.blend.iter_mut().enumerate() {
+                *out = midpoint(a[i], b[i], c[i], d[i]);
             }
-            &self.blend
+            &coarse.blend
         };
-        for (nodes, warps) in nodes.iter().zip(&mut self.warps) {
-            for (m, pair) in warps.chunks_exact_mut(2).enumerate() {
-                pair[0] = nodes[m + 1];
-                pair[1] = midpoint(nodes[m], nodes[m + 1], nodes[m + 2], nodes[m + 3]);
-            }
+        for (m, pair) in coarse.values.chunks_exact_mut(2).enumerate() {
+            pair[0] = nodes[m + 1];
+            pair[1] = midpoint(nodes[m], nodes[m + 1], nodes[m + 2], nodes[m + 3]);
         }
     }
 
     /// Computes the field of row `y` into its slot of the ring.
     fn compute(&mut self, y: usize) {
+        let mut coarse = self.coarse.take();
+        if let Some(coarse) = &mut coarse {
+            self.interpolate_coarse(coarse, y);
+        }
         self.interpolate_warps(y);
         let (table, seed, hue_shift) = (self.table, self.seed, self.hue_shift);
         let py = [y as f32 * self.units_per_pixel; LANES];
@@ -653,12 +840,22 @@ impl Raster {
             let px = lanes(px);
             let (qx, qy) = (lanes(&qx_row[span.clone()]), lanes(&qy_row[span.clone()]));
             let (rx, ry) = (lanes(&rx_row[span.clone()]), lanes(&ry_row[span.clone()]));
-            let f = fbm::<OCTAVES_F>(
-                std::array::from_fn(|l| px[l] + WARP * rx[l]),
-                std::array::from_fn(|l| py[l] + WARP * ry[l]),
-                seed,
-                table,
-            );
+            let x: Lanes = std::array::from_fn(|l| px[l] + WARP * rx[l]);
+            let y: Lanes = std::array::from_fn(|l| py[l] + WARP * ry[l]);
+            let f = match &coarse {
+                None => fbm::<OCTAVES_F>(x, y, seed, table),
+                Some(coarse) => {
+                    let [re, im] = coarse.turn;
+                    let fine = fbm::<FINE_OCTAVES>(
+                        std::array::from_fn(|l| re * x[l] - im * y[l]),
+                        std::array::from_fn(|l| im * x[l] + re * y[l]),
+                        seed,
+                        table,
+                    );
+                    let low = lanes(&coarse.values[span.clone()]);
+                    std::array::from_fn(|l| low[l] + coarse.gain * fine[l])
+                }
+            };
             row.f[span.start + 1..span.end + 1].copy_from_slice(&f);
             let position = lanes_mut(&mut row.position[span]);
             for l in 0..LANES {
@@ -674,7 +871,9 @@ impl Raster {
                 position[l] = shifted.min(HUE_TOP) * (STOPS.len() - 1) as f32;
             }
         }
+        self.coarse = coarse;
         let w = self.width;
+        let row = &mut self.rows[y % 3];
         row.f[0] = 2.0 * row.f[1] - row.f[2];
         row.f[w + 1] = 2.0 * row.f[w] - row.f[w - 1];
     }
@@ -726,21 +925,33 @@ impl Raster {
             *glow = outer * outer * GLOW;
             *mass = smoothstep(THRESHOLD - EDGE, THRESHOLD + EDGE, *f);
         }
+        for (stop, blend) in self.blends.iter_mut().enumerate() {
+            for (blend, &position) in blend.iter_mut().zip(&centre.position) {
+                let t = (position - stop as f32).clamp(0.0, 1.0);
+                *blend = t * t * (3.0 - 2.0 * t);
+            }
+        }
         let [lum, rim, glow] = &self.factors;
+        let [b0, b1, b2, b3, b4] = &self.blends;
         for (channel, light) in self.light.iter_mut().enumerate() {
             let stops = STOPS.map(|stop| stop[channel]);
-            for (((((light, &position), &mass), &lum), &rim), &glow) in light
+            let steps: [f32; STOPS.len() - 1] =
+                std::array::from_fn(|stop| stops[stop + 1] - stops[stop]);
+            for (((((((((light, &mass), &lum), &rim), &glow), &b0), &b1), &b2), &b3), &b4) in light
                 .iter_mut()
-                .zip(&centre.position)
                 .zip(&self.density)
                 .zip(lum)
                 .zip(rim)
                 .zip(glow)
+                .zip(b0)
+                .zip(b1)
+                .zip(b2)
+                .zip(b3)
+                .zip(b4)
             {
                 let mut colour = stops[0];
-                for stop in 1..stops.len() {
-                    let t = (position - (stop - 1) as f32).clamp(0.0, 1.0);
-                    colour += (stops[stop] - stops[stop - 1]) * (t * t * (3.0 - 2.0 * t));
+                for (step, blend) in steps.into_iter().zip([b0, b1, b2, b3, b4]) {
+                    colour += step * blend;
                 }
                 let lit = colour * lum;
                 let lit = lit + rim * (lit * 0.6 + 0.4);

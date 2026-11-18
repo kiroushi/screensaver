@@ -15,14 +15,15 @@ pub fn physical_size(logical: u32, scale: u32) -> u32 {
     ((u64::from(logical) * u64::from(scale) + 60) / 120) as u32
 }
 
-/// Most pixels a keyframe buffer holds, which is 7.2 MB of XRGB8888. Two buffers exist while one
+/// Most pixels a keyframe buffer holds, which is 5.6 MB of XRGB8888. Two buffers exist while one
 /// keyframe is drawn and fades in over another, and the rest of the program holds about 4 MB.
-pub const BUFFER_PIXELS: u32 = 1_800_000;
+/// The time to draw a keyframe grows with this number.
+pub const BUFFER_PIXELS: u32 = 1_400_000;
 
-/// Length of the area a keyframe covers for a physical screen length: a quarter more, rounded to
-/// even.
+/// Length of the area a keyframe covers for a physical screen length: 6.5% more, rounded to
+/// even. That is the room the keyframe's pan and zoom need during its life.
 fn covered_size(screen: u32) -> u32 {
-    ((u64::from(screen) * 5 + 4) / 8) as u32 * 2
+    ((u64::from(screen) * 1065 + 1000) / 2000) as u32 * 2
 }
 
 /// The size of a keyframe buffer for a physical screen size, and the screen pixels per buffer
@@ -80,14 +81,17 @@ mod tests {
         let screen = [3413, 1440].map(|s| physical_size(s, 180));
         assert_eq!(screen, [5120, 2160]);
         let (size, scale) = buffer_layout(screen);
-        assert_eq!(size, [2064, 870]);
-        assert!((scale - 9.6f64.sqrt()).abs() < 1e-12, "scale {scale}");
+        assert_eq!(size, [1820, 768]);
+        assert!(
+            (scale - (12_539_600.0f64 / 1_400_000.0).sqrt()).abs() < 1e-12,
+            "scale {scale}"
+        );
         assert_eq!(
             buffer_layout([1280, 720].map(|s| physical_size(s, 120))),
-            ([1600, 900], 1.0)
+            ([1364, 766], 1.0)
         );
         assert_eq!(physical_size(1281, 150), 1601);
-        assert_eq!(buffer_layout([1601, 810]).0, [1886, 952]);
+        assert_eq!(buffer_layout([1601, 810]).0, [1664, 840]);
     }
 
     #[test]
@@ -107,7 +111,7 @@ mod tests {
             for a in 0..2 {
                 let covered = f64::from(size[a]) * scale;
                 assert!(
-                    covered > f64::from(screen[a]) * 1.24,
+                    covered > f64::from(screen[a]) * 1.055,
                     "screen {screen:?}: the buffer covers {covered} on axis {a}"
                 );
             }

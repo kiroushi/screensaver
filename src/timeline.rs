@@ -6,18 +6,19 @@ use crate::{Look, Rng};
 /// Largest step of the timeline clock per frame, in seconds.
 const MAX_STEP: f64 = 0.1;
 /// Time from the start of one keyframe to the start of the next.
-const PERIOD: f64 = 50.0;
+const PERIOD: f64 = 10.0;
 /// How long a keyframe takes to fade in over the one before.
 const FADE: f64 = 4.0;
 /// How long the first keyframe takes to fade in from black.
 const FIRST_FADE: f64 = 1.0;
 /// How long a keyframe is on screen when the next one is drawn in time.
 const LIFE: f64 = PERIOD + FADE;
-/// How long before a keyframe is due its drawing starts. Its buffer exists from then on, so a
-/// longer lead keeps two buffers alive for longer.
-const DRAW_LEAD: f64 = 15.0;
+/// How long before a keyframe is due its drawing starts. Its buffer exists from then on. The
+/// keyframe before the last one leaves when its fade ends, so no earlier start keeps the buffers
+/// at two.
+const DRAW_LEAD: f64 = PERIOD - FADE;
 /// Source rectangle size relative to the screen at the two ends of a path.
-const ZOOM: [f64; 2] = [1.0, 1.06];
+const ZOOM: [f64; 2] = [1.0, 1.0156];
 /// `wl_fixed` steps per pixel.
 const FIXED: f64 = 256.0;
 
@@ -315,7 +316,7 @@ mod tests {
         0.0
     }
 
-    /// Drawing times from nothing to well past the 15 s a keyframe has before it is due.
+    /// Drawing times from nothing to well past the 6 s a keyframe has before it is due.
     fn late(seed: u64) -> impl Fn(u64) -> f64 {
         move |index| keyframe_rng(seed ^ 0x0de1_a7ed, index).range(0.0, 70.0)
     }
@@ -374,7 +375,7 @@ mod tests {
     #[test]
     fn a_long_gap_moves_the_pan_by_a_tenth_of_a_second_at_most() {
         let mut run = Run::new(7, [5120, 2160], instant);
-        while run.timeline.time() < 30.0 {
+        while run.timeline.time() < 25.0 {
             run.frame();
         }
         let before = run.top().expect("a keyframe shows");
@@ -395,7 +396,7 @@ mod tests {
         let after = run.top().expect("a keyframe shows");
         assert!(run.timeline.time() - time <= MAX_STEP + 1e-9);
         assert_eq!(after.index, before.index);
-        // A 0.1 s step moves the centre by 0.60 buffer pixels here, which is 1.76 px on screen.
+        // A 0.1 s step moves the centre by 0.71 buffer pixels here, which is 2.10 px on screen.
         assert!(reach > 0.5, "reach {reach}");
         assert!(distance(after.centre, before.centre) <= reach + 1e-9);
     }
@@ -458,7 +459,7 @@ mod tests {
         }
     }
 
-    /// One window of 30 frames, 10 s into the life of a keyframe.
+    /// One window of 30 frames, 5 s into the life of a keyframe.
     struct Window {
         index: u64,
         steps: Vec<f64>,
@@ -483,10 +484,10 @@ mod tests {
     }
 
     #[test]
-    fn three_days_behave_like_ten_seconds() {
+    fn three_days_behave_like_five_seconds() {
         let mut run = Run::new(11, [5120, 2160], instant);
-        let early = observe(&mut run, 10.0);
-        let late = observe(&mut run, 3.0 * 86_400.0 + 10.0);
+        let early = observe(&mut run, 5.0);
+        let late = observe(&mut run, 3.0 * 86_400.0 + 5.0);
         assert_eq!(early.index, 0);
         assert_eq!(late.index, 3 * 86_400 / PERIOD as u64);
         for window in [&early, &late] {
@@ -506,24 +507,32 @@ mod tests {
         assert_eq!(seeds.len(), 200, "keyframe seeds repeat");
     }
 
-    // Two keyframes are alive for the 15 s lead and the 4 s fade of every 50 s, which is 0.38.
+    // A keyframe has 6 s to be drawn, from the end of the last fade until it is due.
     #[test]
-    fn two_keyframes_are_alive_for_under_half_of_the_time() {
-        let mut run = Run::new(3, [5120, 2160], |_| 10.0);
-        let (mut frames, mut both) = (0u32, 0u32);
-        while run.timeline.time() < 1000.0 {
+    fn at_most_two_keyframes_are_alive_and_each_starts_on_time() {
+        let mut run = Run::new(3, [5120, 2160], |_| DRAW_LEAD - 0.5);
+        let mut last: Option<(u64, f64)> = None;
+        while run.timeline.time() < 300.0 {
             run.frame();
             let alive =
                 run.timeline.drawn + u64::from(run.pending.is_some()) - run.timeline.retired;
             assert!(alive <= 2, "{alive} keyframes are alive");
-            frames += 1;
-            both += u32::from(alive == 2);
+            let Some(&top) = run.timeline.shown.last() else {
+                continue;
+            };
+            if let Some((index, start)) = last
+                && index != top.index
+            {
+                let gap = top.start - start;
+                assert!(
+                    (gap - PERIOD).abs() < 1e-9,
+                    "keyframe {} started {gap} s after the one before",
+                    top.index
+                );
+            }
+            last = Some((top.index, top.start));
         }
-        let share = f64::from(both) / f64::from(frames);
-        assert!(
-            (0.3..0.45).contains(&share),
-            "two keyframes alive for {share:.3}"
-        );
+        assert!(last.expect("keyframes showed").0 >= 29);
     }
 
     const WEAR_SCREEN: [u32; 2] = [64, 27];
@@ -642,8 +651,8 @@ mod tests {
         })
     }
 
-    // The timeline measures 1.151, 1.160 and 1.077 for red, green and blue. Giving every
-    // keyframe the same seed and pan direction raises that to 6.95, 6.88 and 3.26.
+    // The timeline measures 1.098, 1.101 and 1.057 for red, green and blue. With a 50 s
+    // period, giving every keyframe the same seed and pan direction measured 6.95, 6.88 and 3.26.
     #[test]
     fn every_cell_wears_evenly() {
         let wear = wear();
@@ -661,7 +670,7 @@ mod tests {
         }
     }
 
-    // The timeline measures 158 s. Giving every keyframe the same seed and pan direction leaves
+    // The timeline measures 96 s. Giving every keyframe the same seed and pan direction leaves
     // a cell outside the masses for the whole six hours.
     #[test]
     fn no_cell_stays_dark_for_long() {
