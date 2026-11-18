@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         seed,
         hue_shift: 0.0,
     };
-    let pixels = Raster::render(look, width, height, height as u32, stars);
+    let pixels = Raster::render(look, width, height, height as u32, 1.0, stars);
     let mut out = BufWriter::new(File::create(path)?);
     write!(out, "P6\n{width} {height}\n255\n")?;
     for pixel in pixels.chunks_exact(4) {

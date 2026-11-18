@@ -1,8 +1,8 @@
 //! Fullscreen Wayland client that shows domain-warped keyframes and keeps the display awake.
 //!
-//! Each keyframe lives in a shared-memory buffer on its own subsurface. Frames only move the
-//! viewport source rectangles and change the alpha multipliers, and the compositor does the
-//! scaling and blending.
+//! Each keyframe lives in a shared-memory buffer of its own, which exists from the start of its
+//! drawing until the next keyframe has faded in over it. Frames only move the viewport source
+//! rectangles and change the alpha multipliers, and the compositor does the scaling and blending.
 
 use std::error::Error;
 use std::fs::File;
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{MemfdFlags, memfd_create};
 use rustix::io::Errno;
-use screensaver::{Raster, Source, Timeline, buffer_size, physical_size};
+use screensaver::{Raster, Source, Timeline, buffer_layout, physical_size};
 use wayland_client::backend::WaylandError;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
@@ -37,14 +37,14 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 
 const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
 /// Time after which a frame starts no further row of a keyframe, except for the first keyframe,
-/// which is drawn whole. A row takes about a third of a millisecond, so no frame spends much
-/// more than 2 ms drawing.
+/// which is drawn whole. A row takes about half a millisecond, so no frame spends much more than
+/// 2 ms drawing.
 const DRAW_BUDGET: Duration = Duration::from_micros(1500);
 const FALLBACK_SIZE: (i32, i32) = (1280, 720);
 const KEY_ESCAPE: u32 = 1;
 /// Fractional scale in 120ths when the compositor does not send one.
 const UNSCALED: u32 = 120;
-/// Keyframe buffers, one per subsurface.
+/// Keyframe subsurfaces, and the most keyframe buffers alive at once.
 const SLOTS: usize = 2;
 
 /// One keyframe slot: a synchronized subsurface with its own viewport and alpha multiplier.
@@ -55,11 +55,24 @@ struct Slot {
     alpha: wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1,
 }
 
-/// A slot's buffer in the shared pool and the state the compositor last received for it.
-struct Canvas {
+/// The memory of one keyframe and the buffer that shows it to the compositor.
+struct Store {
+    file: File,
     buffer: wl_buffer::WlBuffer,
-    offset: u64,
-    /// The compositor may still read the buffer, so it must not be written.
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+    }
+}
+
+/// A slot's keyframe buffer and the state the compositor last received for it.
+#[derive(Default)]
+struct Canvas {
+    /// Present from the start of the keyframe's drawing until the compositor releases it.
+    store: Option<Store>,
+    /// The compositor may still read the buffer, so it must not be destroyed.
     busy: bool,
     attached: bool,
     /// Keyframe the buffer holds.
@@ -80,22 +93,15 @@ struct Stage {
     scale: u32,
     screen_height: u32,
     buffer: [usize; 2],
-    file: File,
-    canvases: Vec<Canvas>,
+    /// Screen pixels per buffer pixel.
+    buffer_scale: f64,
+    canvases: [Canvas; SLOTS],
     timeline: Timeline,
     last_frame: Option<Instant>,
     job: Option<Job>,
     band: Vec<u8>,
     /// Slot whose surface is above the other.
     top: usize,
-}
-
-impl Drop for Stage {
-    fn drop(&mut self) {
-        for canvas in &self.canvases {
-            canvas.buffer.destroy();
-        }
-    }
 }
 
 fn slot_of(index: u64) -> usize {
@@ -105,7 +111,12 @@ fn slot_of(index: u64) -> usize {
 impl Stage {
     /// Shows the timeline at the current time and spends what is left of the frame's budget
     /// drawing the next keyframe.
-    fn update(&mut self, slots: &[Slot]) -> std::io::Result<()> {
+    fn update(
+        &mut self,
+        slots: &[Slot],
+        shm: &wl_shm::WlShm,
+        qh: &QueueHandle<App>,
+    ) -> std::io::Result<()> {
         let now = Instant::now();
         let elapsed = self
             .last_frame
@@ -123,22 +134,31 @@ impl Stage {
                 self.top = layer.slot;
             }
         }
-        for ((slot, canvas), layer) in slots.iter().zip(&mut self.canvases).zip(layers) {
+        let drawing = self.job.as_ref().map(|job| slot_of(job.index));
+        let canvases = self.canvases.iter_mut().enumerate();
+        for ((slot, (number, canvas)), layer) in slots.iter().zip(canvases).zip(layers) {
             let mut commit = false;
             match layer {
                 None => {
                     if canvas.attached {
                         slot.surface.attach(None, 0, 0);
                         canvas.attached = false;
+                        canvas.drawn = None;
                         canvas.source = None;
                         canvas.multiplier = None;
                         commit = true;
+                    } else if canvas.drawn.is_none() && !canvas.busy && drawing != Some(number) {
+                        canvas.store = None;
                     }
                 }
                 Some(layer) => {
                     debug_assert_eq!(canvas.drawn, Some(layer.index));
+                    let store = canvas
+                        .store
+                        .as_ref()
+                        .expect("a drawn keyframe has a buffer");
                     if !canvas.attached {
-                        slot.surface.attach(Some(&canvas.buffer), 0, 0);
+                        slot.surface.attach(Some(&store.buffer), 0, 0);
                         slot.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
                         canvas.attached = true;
                         canvas.busy = true;
@@ -162,47 +182,72 @@ impl Stage {
                 slot.surface.commit();
             }
         }
-        self.draw()
+        self.draw(shm, qh)
     }
 
     /// Draws rows of the keyframe the timeline needs next until the budget runs out.
-    fn draw(&mut self) -> std::io::Result<()> {
+    fn draw(&mut self, shm: &wl_shm::WlShm, qh: &QueueHandle<App>) -> std::io::Result<()> {
         let deadline = Instant::now() + DRAW_BUDGET;
-        while self.draw_row()? && Instant::now() < deadline {}
+        while self.draw_row(shm, qh)? && Instant::now() < deadline {}
         Ok(())
     }
 
     /// Draws the whole first keyframe at once, so the screen is black only for as long as that
     /// takes.
-    fn draw_first(&mut self) -> std::io::Result<()> {
-        while self.timeline.wanted() == Some(0) && self.draw_row()? {}
+    fn draw_first(&mut self, shm: &wl_shm::WlShm, qh: &QueueHandle<App>) -> std::io::Result<()> {
+        while self.timeline.wanted() == Some(0) && self.draw_row(shm, qh)? {}
         Ok(())
     }
 
     /// Draws one row of the keyframe the timeline needs next and returns whether there was one.
-    /// A buffer is only written once it is detached and the compositor has released it.
-    fn draw_row(&mut self) -> std::io::Result<bool> {
+    /// The keyframe gets a new buffer once the compositor has released the slot's last one. The
+    /// compositor sees the new buffer only after its last row is written.
+    fn draw_row(&mut self, shm: &wl_shm::WlShm, qh: &QueueHandle<App>) -> std::io::Result<bool> {
         if self.job.is_none() {
             let Some(index) = self.timeline.wanted() else {
                 return Ok(false);
             };
-            let canvas = &self.canvases[slot_of(index)];
+            let slot = slot_of(index);
+            let canvas = &mut self.canvases[slot];
             if canvas.busy || canvas.attached {
                 return Ok(false);
             }
             let [width, height] = self.buffer;
+            let length = width * height * 4;
+            let file = File::from(memfd_create("screensaver", MemfdFlags::CLOEXEC)?);
+            file.set_len(length as u64)?;
+            let pool = shm.create_pool(file.as_fd(), length as i32, qh, ());
+            let buffer = pool.create_buffer(
+                0,
+                width as i32,
+                height as i32,
+                (width * 4) as i32,
+                wl_shm::Format::Xrgb8888,
+                qh,
+                slot,
+            );
+            pool.destroy();
+            canvas.store = Some(Store { file, buffer });
             let look = self.timeline.look(index);
             self.job = Some(Job {
                 index,
-                raster: Raster::new(look, width, height, self.screen_height, true),
+                raster: Raster::new(
+                    look,
+                    width,
+                    height,
+                    self.screen_height,
+                    self.buffer_scale,
+                    true,
+                ),
             });
         }
         let job = self.job.as_mut().expect("a job was just started");
         let canvas = &mut self.canvases[slot_of(job.index)];
         match job.raster.next_band(&mut self.band) {
             Some(row) => {
-                let offset = canvas.offset + (row * self.buffer[0] * 4) as u64;
-                self.file.write_all_at(&self.band, offset)?;
+                let store = canvas.store.as_ref().expect("a job has a buffer");
+                let offset = (row * self.buffer[0] * 4) as u64;
+                store.file.write_all_at(&self.band, offset)?;
             }
             None => {
                 canvas.drawn = Some(job.index);
@@ -277,7 +322,7 @@ impl App {
         self.stage = None;
         let logical = [size.0, size.1].map(|s| s.max(1));
         let screen = logical.map(|s| physical_size(s as u32, scale));
-        let buffer = screen.map(|s| buffer_size(s) as usize);
+        let (buffer, buffer_scale) = buffer_layout(screen);
         while self.slots.len() < SLOTS {
             let surface = self.compositor.create_surface(qh, ());
             let subsurface = self
@@ -296,23 +341,7 @@ impl App {
             });
         }
 
-        let length = buffer[0] * buffer[1] * 4;
-        let total = length * SLOTS;
-        let file = File::from(memfd_create("screensaver", MemfdFlags::CLOEXEC)?);
-        file.set_len(total as u64)?;
-        let pool = self.shm.create_pool(file.as_fd(), total as i32, qh, ());
-        let mut canvases = Vec::with_capacity(SLOTS);
-        for (index, slot) in self.slots.iter().enumerate() {
-            let offset = index * length;
-            let wl_buffer = pool.create_buffer(
-                offset as i32,
-                buffer[0] as i32,
-                buffer[1] as i32,
-                (buffer[0] * 4) as i32,
-                wl_shm::Format::Xrgb8888,
-                qh,
-                index,
-            );
+        for slot in &self.slots {
             slot.viewport.set_destination(logical[0], logical[1]);
             let region = self.compositor.create_region(qh, ());
             region.add(0, 0, logical[0], logical[1]);
@@ -320,25 +349,15 @@ impl App {
             region.destroy();
             slot.surface.attach(None, 0, 0);
             slot.surface.commit();
-            canvases.push(Canvas {
-                buffer: wl_buffer,
-                offset: offset as u64,
-                busy: false,
-                attached: false,
-                drawn: None,
-                source: None,
-                multiplier: None,
-            });
         }
-        pool.destroy();
         self.stage = Some(Stage {
             size,
             scale,
             screen_height: screen[1],
-            buffer,
-            file,
-            canvases,
-            timeline: Timeline::new(self.seed, screen, buffer.map(|s| s as u32)),
+            buffer: buffer.map(|s| s as usize),
+            buffer_scale,
+            canvases: Default::default(),
+            timeline: Timeline::new(self.seed, screen, buffer, buffer_scale),
             last_frame: None,
             job: None,
             band: Vec::new(),
@@ -351,7 +370,7 @@ impl App {
     /// Updates the keyframes and commits the window with a frame callback.
     fn frame(&mut self, qh: &QueueHandle<Self>) -> std::io::Result<()> {
         if let Some(stage) = &mut self.stage {
-            stage.update(&self.slots)?;
+            stage.update(&self.slots, &self.shm, qh)?;
         }
         self.surface.frame(qh, ());
         self.surface.commit();
@@ -466,7 +485,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // The first keyframe is drawn after the first black frame is sent, so the screen goes dark
         // at once.
         if let Some(stage) = &mut app.stage {
-            stage.draw_first()?;
+            stage.draw_first(&app.shm, &qh)?;
         }
 
         let Some(guard) = queue.prepare_read() else {

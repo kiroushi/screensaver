@@ -48,6 +48,10 @@ const SHADE_SLOPE: f32 = 0.02;
 const STARS_PER_PIXEL_AT_810: f64 = 0.0004;
 const STAR_COLOUR: [f32; 3] = [0.85, 0.9, 1.0];
 const STAR_SALT: u64 = 0x5354_4152_5345_4544;
+/// Field samples per buffer pixel along each axis when the buffer is smaller than the area it
+/// covers on screen. One sample per pixel leaves stairs on the mass edges once the compositor
+/// scales the buffer up.
+pub const SUPERSAMPLE: usize = 2;
 
 const fn rgb(hex: u32) -> [f32; 3] {
     [
@@ -276,11 +280,18 @@ struct Star {
 /// Draws a keyframe into a buffer row by row, so the work can be spread across frames.
 ///
 /// The warp vectors vary slowly, so they are evaluated at every other row and column and the
-/// pixels between take a cubic midpoint. Everything else is evaluated at every pixel.
+/// samples between take a cubic midpoint. Everything else is evaluated at every sample. A buffer
+/// pixel is the mean of `samples` by `samples` samples.
 pub struct Raster {
+    /// Samples per row.
     width: usize,
+    /// Rows of samples.
     height: usize,
     stride: usize,
+    samples: usize,
+    out_width: usize,
+    /// Sums of the samples of the buffer row being drawn, per channel.
+    sums: [Vec<f32>; 3],
     seed: u32,
     hue_shift: f32,
     table: &'static Gradients,
@@ -310,16 +321,28 @@ pub struct Raster {
 }
 
 impl Raster {
-    /// A raster of `width` by `height` pixels for a screen `screen_height` pixels high, with or
-    /// without its stars.
-    pub fn new(look: Look, width: usize, height: usize, screen_height: u32, stars: bool) -> Self {
+    /// A raster of `width` by `height` buffer pixels for a screen `screen_height` pixels high,
+    /// with or without its stars. One buffer pixel spans `scale` screen pixels.
+    pub fn new(
+        look: Look,
+        width: usize,
+        height: usize,
+        screen_height: u32,
+        scale: f64,
+        stars: bool,
+    ) -> Self {
         assert!(
             width >= 2 && height >= 2,
             "a keyframe needs two rows and columns"
         );
-        let stride = width.div_ceil(LANES) * LANES;
+        let samples = if scale > 1.0 { SUPERSAMPLE } else { 1 };
+        let out_width = width;
+        let out_stride = width.div_ceil(LANES) * LANES;
+        let (width, height, stride) = (width * samples, height * samples, out_stride * samples);
+        // Screen pixels per sample.
+        let step = scale / samples as f64;
         let nodes = (stride / 2 + 4).div_ceil(LANES) * LANES;
-        let units_per_pixel = (FIELD_HEIGHT / f64::from(screen_height)) as f32;
+        let units_per_pixel = (FIELD_HEIGHT * step / f64::from(screen_height)) as f32;
         let columns = (0..stride).map(|x| x as f32 * units_per_pixel).collect();
         let node_columns = (0..nodes)
             .map(|i| (2 * i as i32 - 2) as f32 * units_per_pixel)
@@ -333,7 +356,7 @@ impl Raster {
             position: vec![0.0; stride],
         };
 
-        let scale = f64::from(screen_height) / 810.0;
+        let scale = f64::from(screen_height) / (810.0 * step);
         let star_list = if stars {
             let mut rng = Rng::new(u64::from(look.seed) ^ STAR_SALT);
             let count =
@@ -363,6 +386,9 @@ impl Raster {
             width,
             height,
             stride,
+            samples,
+            out_width,
+            sums: std::array::from_fn(|_| vec![0.0; out_stride]),
             seed: look.seed.wrapping_mul(0x9E37_79B9),
             hue_shift: look.hue_shift,
             table: gradients(),
@@ -386,13 +412,20 @@ impl Raster {
         }
     }
 
-    /// Renders the next row into `out` as little-endian XRGB8888 and returns its index, or
-    /// `None` once the whole keyframe is drawn.
+    /// Renders the next buffer row into `out` as little-endian XRGB8888 and returns its index,
+    /// or `None` once the whole keyframe is drawn.
     pub fn next_band(&mut self, out: &mut Vec<u8>) -> Option<usize> {
-        let y = self.shade_next()?;
+        let y = self.shade_next()? / self.samples;
+        if self.samples > 1 {
+            self.average();
+        }
         out.clear();
-        out.resize(self.stride * 4, 0);
-        let [red, green, blue] = &self.light;
+        out.resize(self.stride / self.samples * 4, 0);
+        let [red, green, blue] = if self.samples > 1 {
+            &self.sums
+        } else {
+            &self.light
+        };
         for (((pixels, red), green), blue) in out
             .chunks_exact_mut(4 * LANES)
             .zip(red.chunks_exact(LANES))
@@ -404,8 +437,31 @@ impl Raster {
             });
             pixels.copy_from_slice(codes.map(u32::to_le_bytes).as_flattened());
         }
-        out.truncate(self.width * 4);
+        out.truncate(self.out_width * 4);
         Some(y)
+    }
+
+    /// Averages the sample row just shaded and the rest of its buffer row into `sums`. Each
+    /// sample is clamped first, like the screen would clamp it.
+    fn average(&mut self) {
+        let samples = self.samples;
+        let weight = 1.0 / (samples * samples) as f32;
+        for sums in &mut self.sums {
+            sums.fill(0.0);
+        }
+        for row in 0..samples {
+            if row > 0 {
+                self.shade_next()
+                    .expect("the height is a whole number of buffer rows");
+            }
+            for (sums, light) in self.sums.iter_mut().zip(&self.light) {
+                for (sum, group) in sums.iter_mut().zip(light.chunks_exact(samples)) {
+                    for &value in group {
+                        *sum += value.clamp(0.0, 1.0) * weight;
+                    }
+                }
+            }
+        }
     }
 
     /// Draws the whole keyframe at once.
@@ -414,9 +470,10 @@ impl Raster {
         width: usize,
         height: usize,
         screen_height: u32,
+        scale: f64,
         stars: bool,
     ) -> Vec<u8> {
-        let mut raster = Self::new(look, width, height, screen_height, stars);
+        let mut raster = Self::new(look, width, height, screen_height, scale, stars);
         let mut pixels = Vec::with_capacity(width * height * 4);
         let mut band = Vec::new();
         while raster.next_band(&mut band).is_some() {
@@ -644,7 +701,7 @@ pub(crate) struct Probe {
 #[cfg(test)]
 impl Probe {
     pub fn draw(look: Look, width: usize, height: usize, screen_height: u32, stars: bool) -> Self {
-        let mut raster = Raster::new(look, width, height, screen_height, stars);
+        let mut raster = Raster::new(look, width, height, screen_height, 1.0, stars);
         let mut probe = Self {
             pixels: Vec::with_capacity(width * height * 4),
             density: Vec::with_capacity(width * height),

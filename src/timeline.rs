@@ -13,6 +13,9 @@ const FADE: f64 = 4.0;
 const FIRST_FADE: f64 = 1.0;
 /// How long a keyframe is on screen when the next one is drawn in time.
 const LIFE: f64 = PERIOD + FADE;
+/// How long before a keyframe is due its drawing starts. Its buffer exists from then on, so a
+/// longer lead keeps two buffers alive for longer.
+const DRAW_LEAD: f64 = 15.0;
 /// Source rectangle size relative to the screen at the two ends of a path.
 const ZOOM: [f64; 2] = [1.0, 1.06];
 /// `wl_fixed` steps per pixel.
@@ -127,12 +130,13 @@ struct Shown {
 ///
 /// A keyframe starts once it is drawn, and no sooner than [`PERIOD`] after the one before. It
 /// fades in over [`FADE`], or [`FIRST_FADE`] from black for the first keyframe, and the
-/// keyframe under it leaves when the fade ends. Keyframe `n`
-/// lives in slot `n % 2`, so keyframe `n + 2` may be drawn once keyframe `n` has left.
+/// keyframe under it leaves when the fade ends. Keyframe `n` lives in slot `n % 2`. Its drawing
+/// starts [`DRAW_LEAD`] before it is due, by which time keyframe `n - 2` has left the slot.
 #[derive(Clone, Debug)]
 pub struct Timeline {
     seed: u64,
-    screen: [u32; 2],
+    /// Screen size in buffer pixels.
+    screen: [f64; 2],
     buffer: [u32; 2],
     time: f64,
     /// Keyframes `0..drawn` are drawn.
@@ -146,11 +150,12 @@ pub struct Timeline {
 }
 
 impl Timeline {
-    /// A timeline for a screen and keyframe buffers of the given physical sizes.
-    pub fn new(seed: u64, screen: [u32; 2], buffer: [u32; 2]) -> Self {
+    /// A timeline for a physical screen size and keyframe buffers whose pixels each span `scale`
+    /// screen pixels.
+    pub fn new(seed: u64, screen: [u32; 2], buffer: [u32; 2], scale: f64) -> Self {
         Self {
             seed,
-            screen,
+            screen: screen.map(|s| f64::from(s) / scale),
             buffer,
             time: 0.0,
             drawn: 0,
@@ -169,9 +174,13 @@ impl Timeline {
         keyframe_look(self.seed, index)
     }
 
-    /// The next keyframe to draw, once its slot is free.
+    /// The next keyframe to draw, once its slot is free and it is due within [`DRAW_LEAD`].
     pub fn wanted(&self) -> Option<u64> {
-        (self.drawn < self.retired + 2).then_some(self.drawn)
+        let due = match self.shown.last() {
+            None => self.drawn == 0,
+            Some(top) => self.drawn == top.index + 1 && self.time >= top.start + PERIOD - DRAW_LEAD,
+        };
+        (due && self.drawn < self.retired + 2).then_some(self.drawn)
     }
 
     /// Records that keyframe `index`, the one [`Timeline::wanted`] named, is completely drawn.
@@ -207,12 +216,11 @@ impl Timeline {
     }
 
     fn start(&self, index: u64, start: f64) -> Shown {
-        let screen = self.screen.map(f64::from);
         let buffer = self.buffer.map(f64::from);
         Shown {
             index,
             start,
-            path: Path::new(self.seed, index, screen, buffer),
+            path: Path::new(self.seed, index, self.screen, buffer),
         }
     }
 
@@ -237,9 +245,8 @@ impl Timeline {
     fn source(&self, centre: [f64; 2], zoom: f64) -> Source {
         let [x, y] = [0, 1].map(|a| {
             let limit = i64::from(self.buffer[a]) * FIXED as i64;
-            let size = ((f64::from(self.screen[a]) * zoom * FIXED).round() as i64).clamp(1, limit);
-            let origin = (((centre[a] - f64::from(self.screen[a]) * zoom / 2.0) * FIXED).round()
-                as i64)
+            let size = ((self.screen[a] * zoom * FIXED).round() as i64).clamp(1, limit);
+            let origin = (((centre[a] - self.screen[a] * zoom / 2.0) * FIXED).round() as i64)
                 .clamp(0, limit - size);
             (origin as i32, size as i32)
         });
@@ -257,7 +264,7 @@ mod tests {
     use std::sync::OnceLock;
 
     use super::*;
-    use crate::buffer_size;
+    use crate::buffer_layout;
     use crate::field::Probe;
 
     /// Time between the client's frames.
@@ -273,8 +280,9 @@ mod tests {
 
     impl<F: Fn(u64) -> f64> Run<F> {
         fn new(seed: u64, screen: [u32; 2], delay: F) -> Self {
+            let (buffer, scale) = buffer_layout(screen);
             Self {
-                timeline: Timeline::new(seed, screen, screen.map(buffer_size)),
+                timeline: Timeline::new(seed, screen, buffer, scale),
                 delay,
                 pending: None,
             }
@@ -307,7 +315,7 @@ mod tests {
         0.0
     }
 
-    /// Drawing times from nothing to well past the 46 s a keyframe has before it is due.
+    /// Drawing times from nothing to well past the 15 s a keyframe has before it is due.
     fn late(seed: u64) -> impl Fn(u64) -> f64 {
         move |index| keyframe_rng(seed ^ 0x0de1_a7ed, index).range(0.0, 70.0)
     }
@@ -329,7 +337,7 @@ mod tests {
         ];
         for seed in 0..32 {
             for screen in screens {
-                let buffer = screen.map(buffer_size);
+                let (buffer, scale) = buffer_layout(screen);
                 let limit = buffer.map(|b| i64::from(b) * FIXED as i64);
                 let mut run = Run::new(seed, screen, late(seed));
                 for _ in 0..(400.0 / FRAME) as u32 {
@@ -349,7 +357,7 @@ mod tests {
                             );
                         }
                         for a in 0..2 {
-                            let half = f64::from(screen[a]) * layer.zoom / 2.0;
+                            let half = f64::from(screen[a]) / scale * layer.zoom / 2.0;
                             assert!(
                                 layer.centre[a] - half > -1e-9
                                     && layer.centre[a] + half < f64::from(buffer[a]) + 1e-9,
@@ -387,8 +395,8 @@ mod tests {
         let after = run.top().expect("a keyframe shows");
         assert!(run.timeline.time() - time <= MAX_STEP + 1e-9);
         assert_eq!(after.index, before.index);
-        // A 0.1 s step moves the centre by 1.77 px here.
-        assert!(reach > 1.0, "reach {reach}");
+        // A 0.1 s step moves the centre by 0.60 buffer pixels here, which is 1.76 px on screen.
+        assert!(reach > 0.5, "reach {reach}");
         assert!(distance(after.centre, before.centre) <= reach + 1e-9);
     }
 
@@ -498,6 +506,26 @@ mod tests {
         assert_eq!(seeds.len(), 200, "keyframe seeds repeat");
     }
 
+    // Two keyframes are alive for the 15 s lead and the 4 s fade of every 50 s, which is 0.38.
+    #[test]
+    fn two_keyframes_are_alive_for_under_half_of_the_time() {
+        let mut run = Run::new(3, [5120, 2160], |_| 10.0);
+        let (mut frames, mut both) = (0u32, 0u32);
+        while run.timeline.time() < 1000.0 {
+            run.frame();
+            let alive =
+                run.timeline.drawn + u64::from(run.pending.is_some()) - run.timeline.retired;
+            assert!(alive <= 2, "{alive} keyframes are alive");
+            frames += 1;
+            both += u32::from(alive == 2);
+        }
+        let share = f64::from(both) / f64::from(frames);
+        assert!(
+            (0.3..0.45).contains(&share),
+            "two keyframes alive for {share:.3}"
+        );
+    }
+
     const WEAR_SCREEN: [u32; 2] = [64, 27];
     const WEAR_SECONDS: f64 = 6.0 * 3600.0;
     const SAMPLE_FRAMES: u32 = 60;
@@ -529,7 +557,9 @@ mod tests {
         static WEAR: OnceLock<Wear> = OnceLock::new();
         WEAR.get_or_init(|| {
             let [width, height] = WEAR_SCREEN.map(|s| s as usize);
-            let [bw, bh] = WEAR_SCREEN.map(|s| buffer_size(s) as usize);
+            let ([bw, bh], scale) = buffer_layout(WEAR_SCREEN);
+            assert_eq!(scale, 1.0, "the wear screen is drawn at full resolution");
+            let [bw, bh] = [bw, bh].map(|s| s as usize);
             let mut run = Run::new(0x5eed, WEAR_SCREEN, instant);
             let mut images: [(u64, Vec<[f32; 4]>); 2] =
                 [(u64::MAX, Vec::new()), (u64::MAX, Vec::new())];

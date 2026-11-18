@@ -10,7 +10,7 @@ use std::error::Error;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
-use screensaver::{Raster, Timeline, buffer_size};
+use screensaver::{Raster, Timeline, buffer_layout};
 
 const SEED: u64 = 0x5eed;
 const FRAME: f64 = 1.0 / 30.0;
@@ -24,8 +24,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let height: usize = args.next().map_or(Ok(2160), |a| a.parse())?;
 
     let screen = [width as u32, height as u32];
-    let buffer = screen.map(buffer_size);
-    let mut timeline = Timeline::new(SEED, screen, buffer);
+    let (buffer, scale) = buffer_layout(screen);
+    let mut timeline = Timeline::new(SEED, screen, buffer, scale);
     timeline.mark_drawn(0);
     timeline.advance(0.0);
     while time - timeline.time() > 1e-9 {
@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let [bw, bh] = buffer.map(|s| s as usize);
     let mut frame = vec![0.0f32; width * height * 3];
     for layer in timeline.layers() {
-        let pixels = Raster::render(timeline.look(layer.index), bw, bh, screen[1], true);
+        let pixels = Raster::render(timeline.look(layer.index), bw, bh, screen[1], scale, true);
         let texel = |x: usize, y: usize, c: usize| f32::from(pixels[(y * bw + x) * 4 + 2 - c]);
         let [sx, sy, sw, sh] = layer.source.pixels();
         let alpha = layer.alpha as f32;
