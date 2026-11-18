@@ -1,6 +1,6 @@
 # screensaver
 
-A fullscreen screensaver for the COSMIC desktop that shows slowly flowing colour ribbons and keeps the display awake while it is open. The ribbons drift across the whole screen and keep changing hue, so an OLED panel wears evenly.
+A fullscreen screensaver for the COSMIC desktop that shows swirling, marbled colour fields and keeps the display awake while it is open. Each image slowly pans and zooms, and every 50 seconds a new one with its own colour balance fades in over it, so an OLED panel wears evenly.
 
 ## Building
 

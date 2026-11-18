@@ -7,7 +7,7 @@ license = "MIT"
 [dependencies]
 rustix = { version = "1", features = ["fs", "event"] }
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 
 [profile.release]
 opt-level = 3

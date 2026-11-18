@@ -1,26 +1,35 @@
-//! Times 600 frames at the target buffer size and prints the mean milliseconds per frame.
+//! Times drawing one keyframe at the buffer size of a 5120x2160 screen, and its slowest band.
 
 use std::hint::black_box;
 use std::time::Instant;
 
-use screensaver::{BUFFER_WIDTH, Renderer, buffer_height};
+use screensaver::{Look, Raster, buffer_size};
 
-const FRAMES: u32 = 600;
+const SCREEN: [u32; 2] = [5120, 2160];
 
 fn main() {
-    let mut renderer = Renderer::new(BUFFER_WIDTH, buffer_height(3413, 1440));
-    let mut frame = vec![0; renderer.frame_len()];
-    renderer.render(0.0, &mut frame);
-
+    let [width, height] = SCREEN.map(|s| buffer_size(s) as usize);
+    let look = Look {
+        seed: 1,
+        hue_shift: 0.7,
+    };
+    let mut band = Vec::new();
     let start = Instant::now();
-    for i in 0..FRAMES {
-        renderer.render(black_box(f64::from(i) / 30.0), &mut frame);
-        black_box(&frame);
+    let mut raster = Raster::new(look, width, height, SCREEN[1], true);
+    let mut slowest = start.elapsed();
+    loop {
+        let band_start = Instant::now();
+        let row = raster.next_band(&mut band);
+        slowest = slowest.max(band_start.elapsed());
+        if row.is_none() {
+            break;
+        }
+        black_box(&band);
     }
-    let mean = start.elapsed().as_secs_f64() * 1000.0 / f64::from(FRAMES);
+    let elapsed = start.elapsed().as_secs_f64();
     println!(
-        "{FRAMES} frames at {}x{}: {mean:.3} ms per frame",
-        renderer.width(),
-        renderer.height()
+        "keyframe at {width}x{height}: {elapsed:.3} s, {:.1} ns per pixel, slowest band {:.3} ms",
+        elapsed * 1e9 / (width * height) as f64,
+        slowest.as_secs_f64() * 1000.0,
     );
 }
