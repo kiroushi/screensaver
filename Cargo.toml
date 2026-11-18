@@ -1,0 +1,17 @@
+[package]
+name = "screensaver"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+rustix = { version = "1", features = ["fs", "event"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

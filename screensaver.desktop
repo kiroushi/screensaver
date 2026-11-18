@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Screensaver
+Comment=Shows slowly flowing colours and keeps the display awake.
+Exec=@BINDIR@/screensaver
+Icon=screensaver
+Categories=Utility;
+StartupNotify=false
