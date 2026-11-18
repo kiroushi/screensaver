@@ -1,24 +1,24 @@
-//! Domain-warped keyframes drawn on the CPU, and the timeline that fades from one to the next.
+//! Domain-warped keyframes drawn on the CPU, and the timeline that shows one after another.
 //!
 //! Each keyframe is drawn once into its own buffer of at most [`BUFFER_PIXELS`] pixels. The
-//! compositor scales each buffer up to the screen and fades between buffers, so the client never
-//! redraws the screen. Between two fades nothing changes and nobody repaints.
+//! compositor scales the buffer up to the screen. A keyframe replaces the last one in a single
+//! commit, and between two keyframes nothing changes and nobody repaints.
 
 mod field;
 mod stage;
 mod timeline;
 
 pub use field::{Look, Raster, SUPERSAMPLE};
-pub use stage::{SLOTS, Screen, Stage};
-pub use timeline::{FADE_STEPS, Layer, Timeline, keyframe_look};
+pub use stage::{Screen, Stage};
+pub use timeline::{Timeline, keyframe_look};
 
 /// Buffer length in pixels for a logical length at a fractional scale given in 120ths.
 pub fn physical_size(logical: u32, scale: u32) -> u32 {
     ((u64::from(logical) * u64::from(scale) + 60) / 120) as u32
 }
 
-/// Most pixels a keyframe buffer holds, which is 6.0 MB of XRGB8888. Two buffers exist while one
-/// keyframe is drawn and fades in over another, and the rest of the program holds about 4 MB.
+/// Most pixels a keyframe buffer holds, which is 6.0 MB of XRGB8888. Two buffers exist while a
+/// keyframe is drawn, and the rest of the program holds about 3.6 MB.
 /// The time to draw a keyframe grows with this number.
 pub const BUFFER_PIXELS: u32 = 1_500_000;
 

@@ -1,6 +1,6 @@
 # screensaver
 
-A fullscreen screensaver for the COSMIC desktop that shows swirling, marbled colour fields and keeps the display awake while it is open. Every 10 seconds a new image with its own colour balance fades in over the last one, so an OLED panel wears evenly. Between two fades the picture is still and costs the compositor and the GPU nothing.
+A fullscreen screensaver for the COSMIC desktop that shows swirling, marbled colour fields and keeps the display awake while it is open. Every 10 seconds a new image with its own colour balance replaces the last one, so an OLED panel wears evenly. In between the picture is still and costs the compositor and the GPU nothing.
 
 ## Building
 

@@ -1,7 +1,7 @@
 //! Measures the memory the screensaver holds at a 5120x2160 screen without showing anything. It
 //! connects to the compositor and binds `wl_shm` but creates no surface, then allocates and
 //! draws keyframes exactly as the program does: one memfd and one `wl_buffer` per keyframe, with
-//! the second keyframe drawn while the first is alive and the first freed afterwards.
+//! the second keyframe drawn while the first is shown and the first freed afterwards.
 //!
 //! The program writes keyframes with `pwrite` and never maps them, so their pages are missing
 //! from its resident set. The total printed here is the resident set plus the memfd pages.
@@ -156,10 +156,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let first = draw(&mut wayland, &timeline, 0, size, scale)?;
     peak = peak.max(report("one keyframe shown", &[&first])?);
     let second = draw(&mut wayland, &timeline, 1, size, scale)?;
-    peak = peak.max(report(
-        "second keyframe drawn and fading in (peak)",
-        &[&first, &second],
-    )?);
+    peak = peak.max(report("second keyframe drawn (peak)", &[&first, &second])?);
     drop(first);
     if let Some(wayland) = &mut wayland {
         wayland.queue.roundtrip(&mut App)?;

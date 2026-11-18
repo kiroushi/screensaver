@@ -118,8 +118,16 @@ const COSINE: [f32; 5] = [
 fn direction(hash: u32) -> (f32, f32) {
     let r = (hash & 0x3FFF) as i32 as f32 * (1.0 / 16384.0);
     let t = r * r;
-    let sine = r * (SINE[0] + t * (SINE[1] + t * (SINE[2] + t * (SINE[3] + t * SINE[4]))));
-    let cosine = COSINE[0] + t * (COSINE[1] + t * (COSINE[2] + t * (COSINE[3] + t * COSINE[4])));
+    // Fused multiply-adds halve the operations of both polynomials. The build targets a CPU
+    // that has them.
+    let horner = |c: [f32; 5]| {
+        t.mul_add(
+            t.mul_add(t.mul_add(t.mul_add(c[4], c[3]), c[2]), c[1]),
+            c[0],
+        )
+    };
+    let sine = r * horner(SINE);
+    let cosine = horner(COSINE);
     let quadrant = (hash >> 14) & 3;
     // All ones in the odd quadrants, where sine and cosine trade places.
     let odd = 0u32.wrapping_sub(quadrant & 1);
@@ -244,6 +252,7 @@ struct NoiseRow {
     fy: Vec<f32>,
     ax: Vec<u32>,
     by: Vec<u32>,
+    hashes: Vec<u32>,
     dots: [Vec<f32>; 4],
 }
 
@@ -256,6 +265,7 @@ impl NoiseRow {
             fy: vec![0.0; length],
             ax: vec![0; length],
             by: vec![0; length],
+            hashes: vec![0; length],
             dots: std::array::from_fn(|_| vec![0.0; length]),
         }
     }
@@ -293,16 +303,21 @@ fn fbm_row(octaves: usize, seed: u32, mut amplitude: f32, total: &mut [f32], row
                 if down { HASH_Y } else { 0 },
             );
             let (dx, dy) = (f32::from(u8::from(right)), f32::from(u8::from(down)));
-            for ((((dot, &ax), &by), &fx), &fy) in dots[..n]
+            // The hashes get a loop of their own. One loop for the whole corner is a chain of
+            // about 60 cycles per step, and the processor can only work on three such steps at
+            // once.
+            let hashes = &mut row.hashes[..n];
+            for ((hash, &ax), &by) in hashes.iter_mut().zip(axs.iter()).zip(bys.iter()) {
+                *hash = finish(ax.wrapping_add(step_x) ^ by.wrapping_add(step_y) ^ seed);
+            }
+            for (((dot, &hash), &fx), &fy) in dots[..n]
                 .iter_mut()
-                .zip(axs.iter())
-                .zip(bys.iter())
+                .zip(hashes.iter())
                 .zip(fxs.iter())
                 .zip(fys.iter())
             {
-                let hash = finish(ax.wrapping_add(step_x) ^ by.wrapping_add(step_y) ^ seed);
                 let (gx, gy) = direction(hash);
-                *dot = gx * (fx - dx) + gy * (fy - dy);
+                *dot = gx.mul_add(fx - dx, gy * (fy - dy));
             }
         }
         let [a, b, c, d] = &row.dots;
@@ -315,10 +330,12 @@ fn fbm_row(octaves: usize, seed: u32, mut amplitude: f32, total: &mut [f32], row
             .zip(fxs.iter())
             .zip(fys.iter())
         {
-            let ux = tx * tx * tx * (tx * (tx * 6.0 - 15.0) + 10.0);
-            let uy = ty * ty * ty * (ty * (ty * 6.0 - 15.0) + 10.0);
-            let noise = (a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy) * 1.4;
-            *total += amplitude * noise;
+            let fade = |t: f32| t * t * t * t.mul_add(t.mul_add(6.0, -15.0), 10.0);
+            let (ux, uy) = (fade(tx), fade(ty));
+            let top = (b - a).mul_add(ux, a);
+            let bottom = (d - c).mul_add(ux, c);
+            let noise = (bottom - top).mul_add(uy, top);
+            *total = (amplitude * 1.4).mul_add(noise, *total);
         }
         for (x, y) in xs.iter_mut().zip(ys.iter_mut()) {
             (*x, *y) = (
@@ -471,9 +488,15 @@ impl Prefilter {
         let reach = TAPS / 2 - 1;
         let last = self.width - 1;
         for (row, light) in self.rows[self.pushed % TAPS].iter_mut().zip(light) {
-            for (i, padded) in self.padded.iter_mut().enumerate() {
-                *padded = light[i.saturating_sub(reach).min(last)].clamp(0.0, 1.0);
+            // The inside is a plain copy so it compiles to vector code, and the edge samples
+            // repeat on both sides.
+            let inside = &mut self.padded[reach..=reach + last];
+            for (padded, &light) in inside.iter_mut().zip(&light[..=last]) {
+                *padded = light.clamp(0.0, 1.0);
             }
+            let (first, end) = (self.padded[reach], self.padded[reach + last]);
+            self.padded[..reach].fill(first);
+            self.padded[reach + last + 1..].fill(end);
             // The weights are the same from both ends, so each one multiplies a sum of two
             // samples. Walking the row in pairs lets the loop vectorize.
             let (pairs, _) = self.padded.as_chunks::<SUPERSAMPLE>();
@@ -581,8 +604,8 @@ struct Reduced {
     low: Midpoints,
     /// `f` at every buffer pixel, which is every other sample.
     f: Midpoints,
-    /// The hue at every buffer pixel.
-    hue: Midpoints,
+    /// The hue at every buffer pixel of the last pixel rows, by row index modulo 8.
+    hues: [Vec<f32>; 8],
     noise: NoiseRow,
     /// The warp vectors `rx` and `ry`, `f` and the hue of the pixel row being drawn.
     rx: Vec<f32>,
@@ -591,8 +614,6 @@ struct Reduced {
     row_hue: Vec<f32>,
     /// The hue at the warp nodes of the pixel row being drawn.
     node_hue: Vec<f32>,
-    /// The hue at every sample of the row being computed.
-    sample_hue: Vec<f32>,
     /// The turn and scale that the low octaves apply to a position, as a complex factor.
     turn: [f32; 2],
     /// Amplitude of the first octave after the low ones.
@@ -677,10 +698,18 @@ pub struct Raster {
     prefilter: Option<Prefilter>,
     /// The buffer row being drawn, per channel, when a prefilter makes it.
     sums: [Vec<f32>; 3],
+    /// The palette colour of every sample of the buffer row `coloured`, per channel.
+    pixel: [Vec<f32>; 3],
+    /// The palette position of each pixel of that row.
+    position: Vec<f32>,
+    coloured: Option<usize>,
     next_out: usize,
     seed: u32,
     hue_shift: f32,
-    table: &'static Gradients,
+    /// The gradient table, which only a keyframe drawn one sample per screen pixel uses.
+    table: Option<&'static Gradients>,
+    /// Scratch rows for the warp nodes of a supersampled keyframe.
+    node_noise: Option<NoiseRow>,
     units_per_pixel: f32,
     columns: Vec<f32>,
     node_columns: Vec<f32>,
@@ -772,14 +801,13 @@ impl Raster {
             Reduced {
                 low: Midpoints::new(half / 2),
                 f: Midpoints::new(half),
-                hue: Midpoints::new(half),
+                hues: std::array::from_fn(|_| vec![0.0; half]),
                 noise: NoiseRow::new(half),
                 rx: vec![0.0; half],
                 ry: vec![0.0; half],
                 row_f: vec![0.0; half],
                 row_hue: vec![0.0; half],
                 node_hue: vec![0.0; nodes],
-                sample_hue: vec![0.0; stride],
                 turn: turn.map(|t| t as f32),
                 amplitude: 0.5f32.powi(LOW_OCTAVES as i32 + 1),
             }
@@ -848,10 +876,14 @@ impl Raster {
             out_width,
             prefilter: (samples > 1).then(|| Prefilter::new(width, out_stride, height)),
             sums: std::array::from_fn(|_| vec![0.0; out_stride]),
+            pixel: std::array::from_fn(|_| vec![0.0; stride]),
+            position: vec![0.0; out_stride],
+            coloured: None,
             next_out: 0,
             seed: look.seed.wrapping_mul(0x9E37_79B9),
             hue_shift: look.hue_shift,
-            table: gradients(),
+            table: (samples == 1).then(gradients),
+            node_noise: (samples > 1).then(|| NoiseRow::new(nodes)),
             units_per_pixel,
             columns,
             node_columns,
@@ -948,9 +980,34 @@ impl Raster {
             return;
         }
         slot.row = row;
-        let (table, seed) = (self.table, self.seed);
-        let py = [(self.grid as isize * row) as f32 * self.units_per_pixel; LANES];
+        let seed = self.seed;
         let [qx_row, qy_row, rx_row, ry_row] = &mut slot.values;
+        if let Some(noise) = &mut self.node_noise {
+            let py = (self.grid as isize * row) as f32 * self.units_per_pixel;
+            let columns = &self.node_columns;
+            // One row of positions for each of the four values, as in `fbm2`.
+            let place = |noise: &mut NoiseRow, offset: [f32; 2], warp: Option<[&[f32]; 2]>| {
+                for (i, (x, y)) in noise.x.iter_mut().zip(&mut noise.y).enumerate() {
+                    let (wx, wy) = warp.map_or((0.0, 0.0), |[qx, qy]| (WARP * qx[i], WARP * qy[i]));
+                    (*x, *y) = (columns[i] + wx + offset[0], py + wy + offset[1]);
+                }
+            };
+            for (values, offset) in [(&mut *qx_row, [0.0, 0.0]), (&mut *qy_row, Q_OFFSET)] {
+                place(noise, offset, None);
+                values.fill(0.0);
+                fbm_row(OCTAVES_Q, seed, 0.5, values, noise);
+            }
+            for (values, offset) in [(&mut *rx_row, RX_OFFSET), (&mut *ry_row, RY_OFFSET)] {
+                place(noise, offset, Some([qx_row, qy_row]));
+                values.fill(0.0);
+                fbm_row(OCTAVES_R, seed, 0.5, values, noise);
+            }
+            return;
+        }
+        let table = self
+            .table
+            .expect("a keyframe without node rows has the table");
+        let py = [(self.grid as isize * row) as f32 * self.units_per_pixel; LANES];
         for (chunk, px) in self.node_columns.chunks_exact(LANES).enumerate() {
             let px = lanes(px);
             let qx = fbm::<OCTAVES_Q>(*px, py, seed, table);
@@ -1079,7 +1136,7 @@ impl Raster {
             noise,
         );
         reduced.f.put(row, &reduced.row_f);
-        reduced.hue.put(row, &reduced.row_hue);
+        reduced.hues[row.rem_euclid(8) as usize].copy_from_slice(&reduced.row_hue);
     }
 
     /// Computes the field of row `y` into its slot of the ring.
@@ -1090,16 +1147,14 @@ impl Raster {
             for row in Midpoints::needs(y as isize) {
                 self.pixel_row(&mut reduced, row);
             }
-            let row = &mut self.rows[y % 3];
-            reduced.f.fill(y as isize, &mut row.f[1..=n]);
-            reduced.hue.fill(y as isize, &mut reduced.sample_hue);
-            for (position, &hue) in row.position.iter_mut().zip(&reduced.sample_hue) {
-                *position = palette_position(hue, hue_shift);
-            }
+            reduced.f.fill(y as isize, &mut self.rows[y % 3].f[1..=n]);
             self.reduced = Some(reduced);
         } else {
             self.interpolate_warps(y);
-            let (table, seed) = (self.table, self.seed);
+            let table = self
+                .table
+                .expect("a keyframe that is not reduced has the table");
+            let seed = self.seed;
             let py = [y as f32 * self.units_per_pixel; LANES];
             let [qx_row, qy_row, rx_row, ry_row] = &self.warps;
             let row = &mut self.rows[y % 3];
@@ -1175,6 +1230,32 @@ impl Raster {
             *glow = outer * outer * GLOW;
             *mass = smoothstep(THRESHOLD - EDGE, THRESHOLD + EDGE, *f);
         }
+        if self.prefilter.is_some() {
+            if self.coloured != Some(y / SUPERSAMPLE) {
+                self.colour_row(y / SUPERSAMPLE);
+            }
+            // The colour changes far more slowly than a buffer pixel, so the samples of a
+            // buffer pixel share the colour of the pixel.
+            let [lum, rim, glow] = &self.factors;
+            for ((channel, light), colour) in self.light.iter_mut().enumerate().zip(&self.pixel) {
+                for (((((light, &mass), &lum), &rim), &glow), &colour) in light
+                    .iter_mut()
+                    .zip(&self.density)
+                    .zip(lum)
+                    .zip(rim)
+                    .zip(glow)
+                    .zip(colour)
+                {
+                    let lit = colour * lum;
+                    let lit = lit + rim * (lit * 0.6 + 0.4);
+                    *light =
+                        BACKGROUND[channel] * (1.0 - mass) + lit * mass + lit * glow * (1.0 - mass);
+                }
+            }
+            self.dim_stars(y);
+            self.next_row += 1;
+            return Some(y);
+        }
         for (stop, blend) in self.blends.iter_mut().enumerate() {
             for (blend, &position) in blend.iter_mut().zip(&centre.position) {
                 let t = (position - stop as f32).clamp(0.0, 1.0);
@@ -1209,13 +1290,60 @@ impl Raster {
                     BACKGROUND[channel] * (1.0 - mass) + lit * mass + lit * glow * (1.0 - mass);
             }
         }
-        if self.prefilter.is_some() {
-            self.dim_stars(y);
-        } else {
-            self.add_stars(y);
-        }
+        self.add_stars(y);
         self.next_row += 1;
         Some(y)
+    }
+
+    /// Fills `pixel` with the palette colour of every buffer pixel of row `y`, once per sample.
+    fn colour_row(&mut self, y: usize) {
+        self.coloured = Some(y);
+        let reduced = self
+            .reduced
+            .as_ref()
+            .expect("a prefiltered keyframe is reduced");
+        // A buffer pixel is centred a quarter of a pixel past the sample that holds its hue,
+        // along both axes.
+        let below = (y + 1).min(self.height / SUPERSAMPLE - 1);
+        let (hues, next) = (&reduced.hues[y % 8], &reduced.hues[below % 8]);
+        for (((hue, pair), &down), &across) in self
+            .position
+            .iter_mut()
+            .zip(hues.windows(2))
+            .zip(next)
+            .zip(&next[1..])
+        {
+            let (top, bottom) = (0.75 * pair[0] + 0.25 * pair[1], 0.75 * down + 0.25 * across);
+            *hue = palette_position(0.75 * top + 0.25 * bottom, self.hue_shift);
+        }
+        for (stop, blend) in self.blends.iter_mut().enumerate() {
+            for (blend, &position) in blend.iter_mut().zip(&self.position) {
+                let t = (position - stop as f32).clamp(0.0, 1.0);
+                *blend = t * t * (3.0 - 2.0 * t);
+            }
+        }
+        let [b0, b1, b2, b3, b4] = &self.blends;
+        for (channel, pixel) in self.pixel.iter_mut().enumerate() {
+            let stops = STOPS.map(|stop| stop[channel]);
+            let steps: [f32; STOPS.len() - 1] =
+                std::array::from_fn(|stop| stops[stop + 1] - stops[stop]);
+            // Both samples of a buffer pixel get its colour, so the shading reads the colour
+            // like any other row of samples.
+            for (((((pair, &b0), &b1), &b2), &b3), &b4) in pixel
+                .chunks_exact_mut(SUPERSAMPLE)
+                .zip(b0)
+                .zip(b1)
+                .zip(b2)
+                .zip(b3)
+                .zip(b4)
+            {
+                let mut colour = stops[0];
+                for (step, blend) in steps.into_iter().zip([b0, b1, b2, b3, b4]) {
+                    colour += step * blend;
+                }
+                pair.fill(colour);
+            }
+        }
     }
 
     /// Dims the stars of sample row `y` by the mass they sit on, before they are stamped.
