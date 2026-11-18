@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{MemfdFlags, memfd_create};
 use rustix::io::Errno;
-use screensaver::{Raster, Source, Timeline, buffer_layout, physical_size};
+use screensaver::{SLOTS, Screen, Source, Stage, Surface, physical_size};
 use wayland_client::backend::WaylandError;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
@@ -44,8 +44,6 @@ const FALLBACK_SIZE: (i32, i32) = (1280, 720);
 const KEY_ESCAPE: u32 = 1;
 /// Fractional scale in 120ths when the compositor does not send one.
 const UNSCALED: u32 = 120;
-/// Keyframe subsurfaces, and the most keyframe buffers alive at once.
-const SLOTS: usize = 2;
 
 /// One keyframe slot: a synchronized subsurface with its own viewport and alpha multiplier.
 struct Slot {
@@ -59,6 +57,8 @@ struct Slot {
 struct Store {
     file: File,
     buffer: wl_buffer::WlBuffer,
+    /// Bytes per row.
+    stride: usize,
 }
 
 impl Drop for Store {
@@ -67,195 +67,99 @@ impl Drop for Store {
     }
 }
 
-/// A slot's keyframe buffer and the state the compositor last received for it.
-#[derive(Default)]
-struct Canvas {
-    /// Present from the start of the keyframe's drawing until the compositor releases it.
-    store: Option<Store>,
-    /// The compositor may still read the buffer, so it must not be destroyed.
-    busy: bool,
-    attached: bool,
-    /// Keyframe the buffer holds.
-    drawn: Option<u64>,
-    source: Option<Source>,
-    multiplier: Option<u32>,
-}
-
-/// A keyframe being drawn into its slot's buffer, row by row.
-struct Job {
-    index: u64,
-    raster: Raster,
-}
-
-/// Everything that depends on the output's logical size and scale.
-struct Stage {
+/// The stage of one logical size and scale, and when its last frame was shown.
+struct Sized {
     size: (i32, i32),
     scale: u32,
-    screen_height: u32,
-    buffer: [usize; 2],
-    /// Screen pixels per buffer pixel.
-    buffer_scale: f64,
-    canvases: [Canvas; SLOTS],
-    timeline: Timeline,
+    stage: Stage<Store>,
     last_frame: Option<Instant>,
-    job: Option<Job>,
-    band: Vec<u8>,
-    /// Slot whose surface is above the other.
-    top: usize,
 }
 
-fn slot_of(index: u64) -> usize {
-    (index % SLOTS as u64) as usize
+/// The window's surfaces as the stage addresses them. Frame callbacks carry `frame`, the number
+/// of the frame that asked for them.
+struct Window<'a> {
+    surface: &'a wl_surface::WlSurface,
+    slots: &'a [Slot],
+    shm: &'a wl_shm::WlShm,
+    qh: &'a QueueHandle<App>,
+    frame: u64,
 }
 
-impl Stage {
-    /// Shows the timeline at the current time and spends what is left of the frame's budget
-    /// drawing the next keyframe.
-    fn update(
+impl Screen for Window<'_> {
+    type Buffer = Store;
+
+    fn create_buffer(
         &mut self,
-        slots: &[Slot],
-        shm: &wl_shm::WlShm,
-        qh: &QueueHandle<App>,
-    ) -> std::io::Result<()> {
-        let now = Instant::now();
-        let elapsed = self
-            .last_frame
-            .map_or(0.0, |last| (now - last).as_secs_f64());
-        self.last_frame = Some(now);
-        self.timeline.advance(elapsed);
-
-        let mut layers = [None; SLOTS];
-        for (depth, layer) in self.timeline.layers().enumerate() {
-            layers[layer.slot] = Some(layer);
-            if depth > 0 && layer.slot != self.top {
-                slots[layer.slot]
-                    .subsurface
-                    .place_above(&slots[self.top].surface);
-                self.top = layer.slot;
-            }
-        }
-        let drawing = self.job.as_ref().map(|job| slot_of(job.index));
-        let canvases = self.canvases.iter_mut().enumerate();
-        for ((slot, (number, canvas)), layer) in slots.iter().zip(canvases).zip(layers) {
-            let mut commit = false;
-            match layer {
-                None => {
-                    if canvas.attached {
-                        slot.surface.attach(None, 0, 0);
-                        canvas.attached = false;
-                        canvas.drawn = None;
-                        canvas.source = None;
-                        canvas.multiplier = None;
-                        commit = true;
-                    } else if canvas.drawn.is_none() && !canvas.busy && drawing != Some(number) {
-                        canvas.store = None;
-                    }
-                }
-                Some(layer) => {
-                    debug_assert_eq!(canvas.drawn, Some(layer.index));
-                    let store = canvas
-                        .store
-                        .as_ref()
-                        .expect("a drawn keyframe has a buffer");
-                    if !canvas.attached {
-                        slot.surface.attach(Some(&store.buffer), 0, 0);
-                        slot.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-                        canvas.attached = true;
-                        canvas.busy = true;
-                        commit = true;
-                    }
-                    if canvas.source != Some(layer.source) {
-                        let [x, y, width, height] = layer.source.pixels();
-                        slot.viewport.set_source(x, y, width, height);
-                        canvas.source = Some(layer.source);
-                        commit = true;
-                    }
-                    let multiplier = (layer.alpha * f64::from(u32::MAX)).round() as u32;
-                    if canvas.multiplier != Some(multiplier) {
-                        slot.alpha.set_multiplier(multiplier);
-                        canvas.multiplier = Some(multiplier);
-                        commit = true;
-                    }
-                }
-            }
-            if commit {
-                slot.surface.commit();
-            }
-        }
-        self.draw(shm, qh)
+        slot: usize,
+        width: usize,
+        height: usize,
+    ) -> std::io::Result<Store> {
+        let length = width * height * 4;
+        let file = File::from(memfd_create("screensaver", MemfdFlags::CLOEXEC)?);
+        file.set_len(length as u64)?;
+        let pool = self
+            .shm
+            .create_pool(file.as_fd(), length as i32, self.qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            width as i32,
+            height as i32,
+            (width * 4) as i32,
+            wl_shm::Format::Xrgb8888,
+            self.qh,
+            slot,
+        );
+        pool.destroy();
+        Ok(Store {
+            file,
+            buffer,
+            stride: width * 4,
+        })
     }
 
-    /// Draws rows of the keyframe the timeline needs next until the budget runs out.
-    fn draw(&mut self, shm: &wl_shm::WlShm, qh: &QueueHandle<App>) -> std::io::Result<()> {
-        let deadline = Instant::now() + DRAW_BUDGET;
-        while self.draw_row(shm, qh)? && Instant::now() < deadline {}
-        Ok(())
+    fn write_row(&mut self, buffer: &Store, row: usize, pixels: &[u8]) -> std::io::Result<()> {
+        buffer
+            .file
+            .write_all_at(pixels, (row * buffer.stride) as u64)
     }
 
-    /// Draws the whole first keyframe at once, so the screen is black only for as long as that
-    /// takes.
-    fn draw_first(&mut self, shm: &wl_shm::WlShm, qh: &QueueHandle<App>) -> std::io::Result<()> {
-        while self.timeline.wanted() == Some(0) && self.draw_row(shm, qh)? {}
-        Ok(())
+    fn destroy_buffer(&mut self, buffer: Store) {
+        drop(buffer);
     }
 
-    /// Draws one row of the keyframe the timeline needs next and returns whether there was one.
-    /// The keyframe gets a new buffer once the compositor has released the slot's last one. The
-    /// compositor sees the new buffer only after its last row is written.
-    fn draw_row(&mut self, shm: &wl_shm::WlShm, qh: &QueueHandle<App>) -> std::io::Result<bool> {
-        if self.job.is_none() {
-            let Some(index) = self.timeline.wanted() else {
-                return Ok(false);
-            };
-            let slot = slot_of(index);
-            let canvas = &mut self.canvases[slot];
-            if canvas.busy || canvas.attached {
-                return Ok(false);
-            }
-            let [width, height] = self.buffer;
-            let length = width * height * 4;
-            let file = File::from(memfd_create("screensaver", MemfdFlags::CLOEXEC)?);
-            file.set_len(length as u64)?;
-            let pool = shm.create_pool(file.as_fd(), length as i32, qh, ());
-            let buffer = pool.create_buffer(
-                0,
-                width as i32,
-                height as i32,
-                (width * 4) as i32,
-                wl_shm::Format::Xrgb8888,
-                qh,
-                slot,
-            );
-            pool.destroy();
-            canvas.store = Some(Store { file, buffer });
-            let look = self.timeline.look(index);
-            self.job = Some(Job {
-                index,
-                raster: Raster::new(
-                    look,
-                    width,
-                    height,
-                    self.screen_height,
-                    self.buffer_scale,
-                    true,
-                ),
-            });
+    fn attach(&mut self, slot: usize, buffer: Option<&Store>) {
+        let surface = &self.slots[slot].surface;
+        surface.attach(buffer.map(|store| &store.buffer), 0, 0);
+        if buffer.is_some() {
+            surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
         }
-        let job = self.job.as_mut().expect("a job was just started");
-        let canvas = &mut self.canvases[slot_of(job.index)];
-        match job.raster.next_band(&mut self.band) {
-            Some(row) => {
-                let store = canvas.store.as_ref().expect("a job has a buffer");
-                let offset = (row * self.buffer[0] * 4) as u64;
-                store.file.write_all_at(&self.band, offset)?;
-            }
-            None => {
-                canvas.drawn = Some(job.index);
-                self.timeline.mark_drawn(job.index);
-                self.job = None;
-            }
-        }
-        Ok(true)
+    }
+
+    fn set_source(&mut self, slot: usize, source: Source) {
+        let [x, y, width, height] = source.pixels();
+        self.slots[slot].viewport.set_source(x, y, width, height);
+    }
+
+    fn set_alpha(&mut self, slot: usize, multiplier: u32) {
+        self.slots[slot].alpha.set_multiplier(multiplier);
+    }
+
+    fn place_above(&mut self, slot: usize, below: usize) {
+        self.slots[slot]
+            .subsurface
+            .place_above(&self.slots[below].surface);
+    }
+
+    fn request_frame(&mut self, surface: Surface) {
+        let surface = match surface {
+            Surface::Window => self.surface,
+            Surface::Slot(slot) => &self.slots[slot].surface,
+        };
+        surface.frame(self.qh, self.frame);
+    }
+
+    fn commit(&mut self, slot: usize) {
+        self.slots[slot].surface.commit();
     }
 }
 
@@ -280,8 +184,10 @@ struct App {
     /// Preferred fractional scale in 120ths.
     scale: Option<u32>,
     slots: Vec<Slot>,
-    stage: Option<Stage>,
+    stage: Option<Sized>,
     seed: u64,
+    /// Number of the last frame sent, which its frame callbacks carry.
+    frame: u64,
     frame_pending: bool,
     redraw: bool,
 }
@@ -322,7 +228,6 @@ impl App {
         self.stage = None;
         let logical = [size.0, size.1].map(|s| s.max(1));
         let screen = logical.map(|s| physical_size(s as u32, scale));
-        let (buffer, buffer_scale) = buffer_layout(screen);
         while self.slots.len() < SLOTS {
             let surface = self.compositor.create_surface(qh, ());
             let subsurface = self
@@ -350,29 +255,46 @@ impl App {
             slot.surface.attach(None, 0, 0);
             slot.surface.commit();
         }
-        self.stage = Some(Stage {
+        self.stage = Some(Sized {
             size,
             scale,
-            screen_height: screen[1],
-            buffer: buffer.map(|s| s as usize),
-            buffer_scale,
-            canvases: Default::default(),
-            timeline: Timeline::new(self.seed, screen, buffer, buffer_scale),
+            stage: Stage::new(self.seed, screen),
             last_frame: None,
-            job: None,
-            band: Vec::new(),
-            top: SLOTS - 1,
         });
         self.redraw = true;
         Ok(())
     }
 
-    /// Updates the keyframes and commits the window with a frame callback.
-    fn frame(&mut self, qh: &QueueHandle<Self>) -> std::io::Result<()> {
-        if let Some(stage) = &mut self.stage {
-            stage.update(&self.slots, &self.shm, qh)?;
+    /// The window's surfaces for the stage, with the number of the frame being sent.
+    fn window<'a>(&'a self, qh: &'a QueueHandle<Self>) -> Window<'a> {
+        Window {
+            surface: &self.surface,
+            slots: &self.slots,
+            shm: &self.shm,
+            qh,
+            frame: self.frame,
         }
-        self.surface.frame(qh, ());
+    }
+
+    /// Updates the keyframes and commits the window. The stage asks for the frame callback on
+    /// the surfaces that show, and without a stage the window carries it.
+    fn frame(&mut self, qh: &QueueHandle<Self>) -> std::io::Result<()> {
+        self.frame += 1;
+        if let Some(mut sized) = self.stage.take() {
+            let now = Instant::now();
+            let elapsed = sized
+                .last_frame
+                .map_or(0.0, |last| (now - last).as_secs_f64());
+            sized.last_frame = Some(now);
+            let deadline = now + DRAW_BUDGET;
+            let result = sized
+                .stage
+                .frame(elapsed, &mut self.window(qh), || Instant::now() < deadline);
+            self.stage = Some(sized);
+            result?;
+        } else {
+            self.surface.frame(qh, self.frame);
+        }
         self.surface.commit();
         self.frame_pending = true;
         self.redraw = false;
@@ -449,6 +371,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         slots: Vec::new(),
         stage: None,
         seed,
+        frame: 0,
         frame_pending: false,
         redraw: false,
     };
@@ -484,8 +407,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         // The first keyframe is drawn after the first black frame is sent, so the screen goes dark
         // at once.
-        if let Some(stage) = &mut app.stage {
-            stage.draw_first(&app.shm, &qh)?;
+        if let Some(mut sized) = app.stage.take() {
+            let result = sized.stage.draw_first(&mut app.window(&qh));
+            app.stage = Some(sized);
+            result?;
         }
 
         let Some(guard) = queue.prepare_read() else {
@@ -595,16 +520,19 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for App {
     }
 }
 
-impl Dispatch<wl_callback::WlCallback, ()> for App {
+impl Dispatch<wl_callback::WlCallback, u64> for App {
     fn event(
         app: &mut Self,
         _: &wl_callback::WlCallback,
         event: wl_callback::Event,
-        _: &(),
+        frame: &u64,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_callback::Event::Done { .. } = event {
+        // A surface that stopped showing answers an older frame up to a second late.
+        if let wl_callback::Event::Done { .. } = event
+            && *frame == app.frame
+        {
             app.frame_pending = false;
         }
     }
@@ -620,10 +548,9 @@ impl Dispatch<wl_buffer::WlBuffer, usize> for App {
         _: &QueueHandle<Self>,
     ) {
         if let wl_buffer::Event::Release = event
-            && let Some(stage) = &mut app.stage
-            && let Some(canvas) = stage.canvases.get_mut(*slot)
+            && let Some(sized) = &mut app.stage
         {
-            canvas.busy = false;
+            sized.stage.released(*slot);
         }
     }
 }

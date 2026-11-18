@@ -5,9 +5,11 @@
 //! buffers, so the client never redraws the screen.
 
 mod field;
+mod stage;
 mod timeline;
 
 pub use field::{Look, Raster, SUPERSAMPLE};
+pub use stage::{SLOTS, Screen, Stage, Surface};
 pub use timeline::{Layer, Source, Timeline, keyframe_look};
 
 /// Buffer length in pixels for a logical length at a fractional scale given in 120ths.
