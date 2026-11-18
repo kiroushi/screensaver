@@ -49,8 +49,7 @@ const STARS_PER_PIXEL_AT_810: f64 = 0.0004;
 const STAR_COLOUR: [f32; 3] = [0.85, 0.9, 1.0];
 const STAR_SALT: u64 = 0x5354_4152_5345_4544;
 /// Field samples per buffer pixel along each axis when the buffer is smaller than the area it
-/// covers on screen. One sample per pixel leaves stairs on the mass edges once the compositor
-/// scales the buffer up.
+/// covers on screen.
 pub const SUPERSAMPLE: usize = 2;
 
 const fn rgb(hex: u32) -> [f32; 3] {
@@ -260,6 +259,81 @@ struct WarpRow {
     values: [Vec<f32>; 4],
 }
 
+/// Samples the prefilter weighs for one buffer pixel along each axis.
+const TAPS: usize = 6;
+/// Weights of those samples: a tent three buffer pixels wide, centred between the pixel's own two
+/// samples. The compositor's bilinear filter turns any detail near one buffer pixel wide into
+/// beads along diagonal streaks, so the weights reach into the neighbouring pixels to remove it.
+const PREFILTER: [f32; TAPS] = [
+    1.0 / 18.0,
+    3.0 / 18.0,
+    5.0 / 18.0,
+    5.0 / 18.0,
+    3.0 / 18.0,
+    1.0 / 18.0,
+];
+
+/// Turns rows of samples, [`SUPERSAMPLE`] per buffer pixel along each axis, into buffer rows.
+struct Prefilter {
+    /// Samples per row.
+    width: usize,
+    /// Rows of samples.
+    height: usize,
+    /// The last [`TAPS`] sample rows, weighed along the row, by row index modulo [`TAPS`].
+    rows: [[Vec<f32>; 3]; TAPS],
+    /// One channel of a sample row with its edge samples repeated on both sides.
+    padded: Vec<f32>,
+    /// Sample rows received.
+    pushed: usize,
+}
+
+impl Prefilter {
+    fn new(width: usize, out_stride: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            rows: std::array::from_fn(|_| std::array::from_fn(|_| vec![0.0; out_stride])),
+            padded: vec![0.0; out_stride * SUPERSAMPLE + TAPS],
+            pushed: 0,
+        }
+    }
+
+    /// The last sample row that buffer row `y` needs.
+    fn last_row(&self, y: usize) -> usize {
+        (SUPERSAMPLE * y + TAPS / 2).min(self.height - 1)
+    }
+
+    /// Takes the next sample row. Each sample is clamped first, like the screen would clamp it.
+    fn push(&mut self, light: &[Vec<f32>; 3]) {
+        let reach = TAPS / 2 - 1;
+        let last = self.width - 1;
+        for (row, light) in self.rows[self.pushed % TAPS].iter_mut().zip(light) {
+            for (i, padded) in self.padded.iter_mut().enumerate() {
+                *padded = light[i.saturating_sub(reach).min(last)].clamp(0.0, 1.0);
+            }
+            for (j, out) in row.iter_mut().enumerate() {
+                let window = &self.padded[SUPERSAMPLE * j..][..TAPS];
+                *out = window.iter().zip(PREFILTER).map(|(v, w)| v * w).sum();
+            }
+        }
+        self.pushed += 1;
+    }
+
+    /// Writes buffer row `y` once [`Prefilter::last_row`] of it has been pushed.
+    fn row(&self, y: usize, out: &mut [Vec<f32>; 3]) {
+        let first = (SUPERSAMPLE * y + 1) as isize - (TAPS / 2) as isize;
+        for (channel, out) in out.iter_mut().enumerate() {
+            out.fill(0.0);
+            for (tap, weight) in PREFILTER.into_iter().enumerate() {
+                let row = (first + tap as isize).clamp(0, self.height as isize - 1) as usize;
+                for (out, value) in out.iter_mut().zip(&self.rows[row % TAPS][channel]) {
+                    *out += value * weight;
+                }
+            }
+        }
+    }
+}
+
 /// Field values of one row.
 #[derive(Clone)]
 struct FieldRow {
@@ -280,18 +354,19 @@ struct Star {
 /// Draws a keyframe into a buffer row by row, so the work can be spread across frames.
 ///
 /// The warp vectors vary slowly, so they are evaluated at every other row and column and the
-/// samples between take a cubic midpoint. Everything else is evaluated at every sample. A buffer
-/// pixel is the mean of `samples` by `samples` samples.
+/// samples between take a cubic midpoint. Everything else is evaluated at every sample. A
+/// [`Prefilter`] turns the samples into buffer pixels when there are more samples than pixels.
 pub struct Raster {
     /// Samples per row.
     width: usize,
     /// Rows of samples.
     height: usize,
     stride: usize,
-    samples: usize,
     out_width: usize,
-    /// Sums of the samples of the buffer row being drawn, per channel.
+    prefilter: Option<Prefilter>,
+    /// The buffer row being drawn, per channel, when a prefilter makes it.
     sums: [Vec<f32>; 3],
+    next_out: usize,
     seed: u32,
     hue_shift: f32,
     table: &'static Gradients,
@@ -386,9 +461,10 @@ impl Raster {
             width,
             height,
             stride,
-            samples,
             out_width,
+            prefilter: (samples > 1).then(|| Prefilter::new(width, out_stride, height)),
             sums: std::array::from_fn(|_| vec![0.0; out_stride]),
+            next_out: 0,
             seed: look.seed.wrapping_mul(0x9E37_79B9),
             hue_shift: look.hue_shift,
             table: gradients(),
@@ -415,13 +491,27 @@ impl Raster {
     /// Renders the next buffer row into `out` as little-endian XRGB8888 and returns its index,
     /// or `None` once the whole keyframe is drawn.
     pub fn next_band(&mut self, out: &mut Vec<u8>) -> Option<usize> {
-        let y = self.shade_next()? / self.samples;
-        if self.samples > 1 {
-            self.average();
-        }
+        let y = match &self.prefilter {
+            None => self.shade_next()?,
+            Some(prefilter) => {
+                let y = self.next_out;
+                if y >= self.height / SUPERSAMPLE {
+                    return None;
+                }
+                for _ in prefilter.pushed..=prefilter.last_row(y) {
+                    self.shade_next().expect("the row is inside the keyframe");
+                    let prefilter = self.prefilter.as_mut().expect("checked above");
+                    prefilter.push(&self.light);
+                }
+                let prefilter = self.prefilter.as_ref().expect("checked above");
+                prefilter.row(y, &mut self.sums);
+                self.next_out += 1;
+                y
+            }
+        };
         out.clear();
-        out.resize(self.stride / self.samples * 4, 0);
-        let [red, green, blue] = if self.samples > 1 {
+        out.resize(self.sums[0].len() * 4, 0);
+        let [red, green, blue] = if self.prefilter.is_some() {
             &self.sums
         } else {
             &self.light
@@ -439,29 +529,6 @@ impl Raster {
         }
         out.truncate(self.out_width * 4);
         Some(y)
-    }
-
-    /// Averages the sample row just shaded and the rest of its buffer row into `sums`. Each
-    /// sample is clamped first, like the screen would clamp it.
-    fn average(&mut self) {
-        let samples = self.samples;
-        let weight = 1.0 / (samples * samples) as f32;
-        for sums in &mut self.sums {
-            sums.fill(0.0);
-        }
-        for row in 0..samples {
-            if row > 0 {
-                self.shade_next()
-                    .expect("the height is a whole number of buffer rows");
-            }
-            for (sums, light) in self.sums.iter_mut().zip(&self.light) {
-                for (sum, group) in sums.iter_mut().zip(light.chunks_exact(samples)) {
-                    for &value in group {
-                        *sum += value.clamp(0.0, 1.0) * weight;
-                    }
-                }
-            }
-        }
     }
 
     /// Draws the whole keyframe at once.
@@ -768,6 +835,66 @@ mod tests {
             (0.68..0.74).contains(&mean),
             "mean coloured share {mean:.3}"
         );
+    }
+
+    /// Brightness along the centre of a thin line at `angle`, after the prefilter and the
+    /// compositor's bilinear filter. The line has a Gaussian profile with a deviation of half a
+    /// buffer pixel.
+    fn along_a_thin_line(angle: f64) -> Vec<f64> {
+        const SIZE: usize = 96;
+        const DEVIATION: f64 = 0.5;
+        let samples = SIZE * SUPERSAMPLE;
+        let centre = SIZE as f64 / 2.0;
+        let (sin, cos) = angle.sin_cos();
+        // Buffer pixel `j` is centred between samples `2 * j` and `2 * j + 1`.
+        let position = |sample: usize| (sample as f64 - 0.5) / SUPERSAMPLE as f64;
+        let mut prefilter = Prefilter::new(samples, SIZE, samples);
+        let mut out: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0.0; SIZE]);
+        let mut buffer = Vec::with_capacity(SIZE);
+        for y in 0..SIZE {
+            for row in prefilter.pushed..=prefilter.last_row(y) {
+                let line: Vec<f32> = (0..samples)
+                    .map(|column| {
+                        let distance =
+                            (position(row) - centre) * cos - (position(column) - centre) * sin;
+                        (-distance * distance / (2.0 * DEVIATION * DEVIATION)).exp() as f32
+                    })
+                    .collect();
+                prefilter.push(&[line.clone(), line.clone(), line]);
+            }
+            prefilter.row(y, &mut out);
+            buffer.push(out[0].clone());
+        }
+        (-240..240)
+            .map(|step| {
+                let along = f64::from(step) * 0.1;
+                let (x, y) = (centre + along * cos, centre + along * sin);
+                let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+                let (fx, fy) = (x.fract(), y.fract());
+                let texel = |x: usize, y: usize| f64::from(buffer[y][x]);
+                let top = texel(x0, y0) * (1.0 - fx) + texel(x0 + 1, y0) * fx;
+                let bottom = texel(x0, y0 + 1) * (1.0 - fx) + texel(x0 + 1, y0 + 1) * fx;
+                top * (1.0 - fy) + bottom * fy
+            })
+            .collect()
+    }
+
+    // The worst angle measures 0.17. A mean of the pixel's own 2x2 samples measures 0.38 and
+    // shows as beads along the streaks, and the tent `(1, 3, 3, 1) / 8` measures 0.27.
+    #[test]
+    fn a_thin_diagonal_streak_has_no_beads() {
+        for degrees in [8.0, 17.0, 26.565, 33.0, 41.0, 45.0f64] {
+            let line = along_a_thin_line(degrees.to_radians());
+            let (min, max) = line
+                .iter()
+                .fold((f64::MAX, f64::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+            let mean = line.iter().sum::<f64>() / line.len() as f64;
+            let modulation = (max - min) / mean;
+            assert!(
+                modulation < 0.2,
+                "a streak at {degrees} degrees varies by {modulation:.3} along its length"
+            );
+        }
     }
 
     // The rarest stop, aqua, is the nearest one for 0.070 of the coloured pixels.
