@@ -1,8 +1,9 @@
 //! Fullscreen Wayland client that shows domain-warped keyframes and keeps the display awake.
 //!
 //! Each keyframe lives in a shared-memory buffer of its own, which exists from the start of its
-//! drawing until the next keyframe has faded in over it. Frames only move the viewport source
-//! rectangles and change the alpha multipliers, and the compositor does the scaling and blending.
+//! drawing until the next keyframe has faded in over it. The compositor does the scaling and
+//! blending. The client commits only the alpha levels of a fade, so between two fades the
+//! compositor repaints nothing and the client sleeps in `poll`.
 
 use std::error::Error;
 use std::fs::File;
@@ -14,12 +15,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{MemfdFlags, memfd_create};
 use rustix::io::Errno;
-use screensaver::{SLOTS, Screen, Source, Stage, Surface, physical_size};
+use screensaver::{SLOTS, Screen, Stage, physical_size};
 use wayland_client::backend::WaylandError;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_region, wl_registry,
-    wl_seat, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
+    wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_region, wl_registry, wl_seat, wl_shm,
+    wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, QueueHandle, WEnum, delegate_noop};
 use wayland_protocols::wp::alpha_modifier::v1::client::{
@@ -35,10 +36,8 @@ use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buff
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
-const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
-/// Time after which a frame starts no further row of a keyframe, except for the first keyframe,
-/// which is drawn whole. A row takes about a tenth of a millisecond, so no frame spends much
-/// more than 1.5 ms drawing.
+/// Time after which a slice of drawing starts no further row of a keyframe, except for the first
+/// keyframe, which is drawn whole. A row takes about a tenth of a millisecond.
 const DRAW_BUDGET: Duration = Duration::from_micros(1500);
 const FALLBACK_SIZE: (i32, i32) = (1280, 720);
 const KEY_ESCAPE: u32 = 1;
@@ -67,22 +66,19 @@ impl Drop for Store {
     }
 }
 
-/// The stage of one logical size and scale, and when its last frame was shown.
+/// The stage of one logical size and scale, and the instant its timeline counts from.
 struct Sized {
     size: (i32, i32),
     scale: u32,
     stage: Stage<Store>,
-    last_frame: Option<Instant>,
+    epoch: Instant,
 }
 
-/// The window's surfaces as the stage addresses them. Frame callbacks carry `frame`, the number
-/// of the frame that asked for them.
+/// The window's keyframe surfaces as the stage addresses them.
 struct Window<'a> {
-    surface: &'a wl_surface::WlSurface,
     slots: &'a [Slot],
     shm: &'a wl_shm::WlShm,
     qh: &'a QueueHandle<App>,
-    frame: u64,
 }
 
 impl Screen for Window<'_> {
@@ -135,11 +131,6 @@ impl Screen for Window<'_> {
         }
     }
 
-    fn set_source(&mut self, slot: usize, source: Source) {
-        let [x, y, width, height] = source.pixels();
-        self.slots[slot].viewport.set_source(x, y, width, height);
-    }
-
     fn set_alpha(&mut self, slot: usize, multiplier: u32) {
         self.slots[slot].alpha.set_multiplier(multiplier);
     }
@@ -148,14 +139,6 @@ impl Screen for Window<'_> {
         self.slots[slot]
             .subsurface
             .place_above(&self.slots[below].surface);
-    }
-
-    fn request_frame(&mut self, surface: Surface) {
-        let surface = match surface {
-            Surface::Window => self.surface,
-            Surface::Slot(slot) => &self.slots[slot].surface,
-        };
-        surface.frame(self.qh, self.frame);
     }
 
     fn commit(&mut self, slot: usize) {
@@ -186,9 +169,7 @@ struct App {
     slots: Vec<Slot>,
     stage: Option<Sized>,
     seed: u64,
-    /// Number of the last frame sent, which its frame callbacks carry.
-    frame: u64,
-    frame_pending: bool,
+    /// The window has state that waits for a commit.
     redraw: bool,
 }
 
@@ -259,46 +240,49 @@ impl App {
             size,
             scale,
             stage: Stage::new(self.seed, screen),
-            last_frame: None,
+            epoch: Instant::now(),
         });
         self.redraw = true;
         Ok(())
     }
 
-    /// The window's surfaces for the stage, with the number of the frame being sent.
+    /// The window's keyframe surfaces for the stage.
     fn window<'a>(&'a self, qh: &'a QueueHandle<Self>) -> Window<'a> {
         Window {
-            surface: &self.surface,
             slots: &self.slots,
             shm: &self.shm,
             qh,
-            frame: self.frame,
         }
     }
 
-    /// Updates the keyframes and commits the window. The stage asks for the frame callback on
-    /// the surfaces that show, and without a stage the window carries it.
-    fn frame(&mut self, qh: &QueueHandle<Self>) -> std::io::Result<()> {
-        self.frame += 1;
-        if let Some(mut sized) = self.stage.take() {
-            let now = Instant::now();
-            let elapsed = sized
-                .last_frame
-                .map_or(0.0, |last| (now - last).as_secs_f64());
-            sized.last_frame = Some(now);
-            let deadline = now + DRAW_BUDGET;
-            let result = sized
-                .stage
-                .frame(elapsed, &mut self.window(qh), || Instant::now() < deadline);
-            self.stage = Some(sized);
-            result?;
-        } else {
-            self.surface.frame(qh, self.frame);
+    /// Shows the timeline at the current time, draws a slice of the next keyframe, and commits
+    /// the window only if something on screen changed. Returns how long the client may sleep,
+    /// or `None` if only the compositor can wake it.
+    fn update(&mut self, qh: &QueueHandle<Self>) -> std::io::Result<Option<Duration>> {
+        let Some(mut sized) = self.stage.take() else {
+            if std::mem::take(&mut self.redraw) {
+                self.surface.commit();
+            }
+            return Ok(None);
+        };
+        let now = Instant::now();
+        let time = (now - sized.epoch).as_secs_f64();
+        let mut window = self.window(qh);
+        let changed = sized.stage.show(time, &mut window);
+        let deadline = now + DRAW_BUDGET;
+        let result = sized
+            .stage
+            .draw(time, &mut window, || Instant::now() < deadline);
+        let sleep = sized
+            .stage
+            .next_wake()
+            .map(|wake| Duration::from_secs_f64((wake - time).max(0.0)));
+        self.stage = Some(sized);
+        result?;
+        if changed || std::mem::take(&mut self.redraw) {
+            self.surface.commit();
         }
-        self.surface.commit();
-        self.frame_pending = true;
-        self.redraw = false;
-        Ok(())
+        Ok(sleep)
     }
 }
 
@@ -371,34 +355,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         slots: Vec::new(),
         stage: None,
         seed,
-        frame: 0,
-        frame_pending: false,
         redraw: false,
     };
 
-    let mut next_frame = Instant::now();
     while app.running {
         queue.dispatch_pending(&mut app)?;
         if !app.running {
             break;
         }
         app.prepare_stage(&qh)?;
-
-        let now = Instant::now();
-        let mut timeout = None;
-        if app.size.is_some() && (app.redraw || !app.frame_pending) {
-            if app.redraw || now >= next_frame {
-                app.frame(&qh)?;
-                let scheduled = next_frame + FRAME_INTERVAL;
-                next_frame = if scheduled > now {
-                    scheduled
-                } else {
-                    now + FRAME_INTERVAL
-                };
-            } else {
-                timeout = Some(next_frame - now);
-            }
-        }
+        let mut timeout = if app.size.is_some() {
+            app.update(&qh)?
+        } else {
+            None
+        };
 
         let flush_blocked = match conn.flush() {
             Ok(()) => false,
@@ -409,6 +379,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         // at once.
         if let Some(mut sized) = app.stage.take() {
             let result = sized.stage.draw_first(&mut app.window(&qh));
+            // The keyframe just drawn starts as soon as the loop comes round.
+            if sized
+                .stage
+                .next_wake()
+                .is_some_and(|wake| wake <= sized.stage.timeline().time())
+            {
+                timeout = Some(Duration::ZERO);
+            }
             app.stage = Some(sized);
             result?;
         }
@@ -516,24 +494,6 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for App {
     ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
             app.scale = Some(scale);
-        }
-    }
-}
-
-impl Dispatch<wl_callback::WlCallback, u64> for App {
-    fn event(
-        app: &mut Self,
-        _: &wl_callback::WlCallback,
-        event: wl_callback::Event,
-        frame: &u64,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        // A surface that stopped showing answers an older frame up to a second late.
-        if let wl_callback::Event::Done { .. } = event
-            && *frame == app.frame
-        {
-            app.frame_pending = false;
         }
     }
 }

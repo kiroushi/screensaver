@@ -6,19 +6,12 @@
 
 use std::io;
 
-use crate::{Raster, Source, Timeline, buffer_layout};
+use crate::{Raster, Timeline, buffer_layout};
 
 /// Keyframe surfaces, and the most keyframe buffers alive at once.
 pub const SLOTS: usize = 2;
-
-/// A surface of the window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Surface {
-    /// The toplevel, which shows opaque black under the keyframes.
-    Window,
-    /// The synchronized subsurface of a keyframe slot.
-    Slot(usize),
-}
+/// Shortest time between two slices of drawing, in seconds.
+const SLICE_INTERVAL: f64 = 1.0 / 30.0;
 
 /// The requests the stage sends to the compositor. Every request for a slot takes effect with
 /// the next commit of the window.
@@ -42,14 +35,9 @@ pub trait Screen {
     /// Attaches a buffer to a slot with damage over all of it, or detaches the slot's buffer.
     fn attach(&mut self, slot: usize, buffer: Option<&Self::Buffer>);
 
-    fn set_source(&mut self, slot: usize, source: Source);
-
     fn set_alpha(&mut self, slot: usize, multiplier: u32);
 
     fn place_above(&mut self, slot: usize, below: usize);
-
-    /// Asks for a frame callback on a surface.
-    fn request_frame(&mut self, surface: Surface);
 
     fn commit(&mut self, slot: usize);
 }
@@ -63,7 +51,6 @@ struct Canvas<B> {
     attached: bool,
     /// Keyframe the buffer holds.
     drawn: Option<u64>,
-    source: Option<Source>,
     multiplier: Option<u32>,
 }
 
@@ -74,7 +61,6 @@ impl<B> Default for Canvas<B> {
             busy: false,
             attached: false,
             drawn: None,
-            source: None,
             multiplier: None,
         }
     }
@@ -98,6 +84,8 @@ pub struct Stage<B> {
     band: Vec<u8>,
     /// Slot whose surface is above the other.
     top: usize,
+    /// Earliest time of the next slice of drawing.
+    next_slice: f64,
 }
 
 fn slot_of(index: u64) -> usize {
@@ -114,10 +102,11 @@ impl<B> Stage<B> {
             buffer: buffer.map(|s| s as usize),
             buffer_scale,
             canvases: Default::default(),
-            timeline: Timeline::new(seed, screen, buffer, buffer_scale),
+            timeline: Timeline::new(seed),
             job: None,
             band: Vec::new(),
             top: SLOTS - 1,
+            next_slice: 0.0,
         }
     }
 
@@ -132,27 +121,23 @@ impl<B> Stage<B> {
         }
     }
 
-    /// Shows the timeline `elapsed` seconds after the last frame, asks for the next frame
-    /// callback, and draws rows of the next keyframe while `more` allows. The caller commits the
-    /// window afterwards.
-    pub fn frame<S: Screen<Buffer = B>>(
-        &mut self,
-        elapsed: f64,
-        screen: &mut S,
-        more: impl FnMut() -> bool,
-    ) -> io::Result<()> {
-        self.timeline.advance(elapsed);
+    /// Shows the timeline at `time` in seconds and returns whether anything on screen changed,
+    /// in which case the caller commits the window. Every commit makes the compositor repaint,
+    /// so nothing is sent while the screen stays as it is.
+    pub fn show<S: Screen<Buffer = B>>(&mut self, time: f64, screen: &mut S) -> bool {
+        self.timeline.advance_to(time);
 
+        let mut changed = false;
         let mut layers = [None; SLOTS];
         for (depth, layer) in self.timeline.layers().enumerate() {
             layers[layer.slot] = Some(layer);
             if depth > 0 && layer.slot != self.top {
                 screen.place_above(layer.slot, self.top);
                 self.top = layer.slot;
+                changed = true;
             }
         }
         let drawing = self.job.as_ref().map(|job| slot_of(job.index));
-        let mut opaque = false;
         for ((number, canvas), layer) in self.canvases.iter_mut().enumerate().zip(layers) {
             let Some(layer) = layer else {
                 if canvas.attached {
@@ -160,8 +145,8 @@ impl<B> Stage<B> {
                     screen.commit(number);
                     canvas.attached = false;
                     canvas.drawn = None;
-                    canvas.source = None;
                     canvas.multiplier = None;
+                    changed = true;
                 } else if canvas.drawn.is_none()
                     && !canvas.busy
                     && drawing != Some(number)
@@ -172,6 +157,7 @@ impl<B> Stage<B> {
                 continue;
             };
             debug_assert_eq!(canvas.drawn, Some(layer.index));
+            let mut commit = false;
             if !canvas.attached {
                 let buffer = canvas
                     .buffer
@@ -180,36 +166,43 @@ impl<B> Stage<B> {
                 screen.attach(number, Some(buffer));
                 canvas.attached = true;
                 canvas.busy = true;
+                commit = true;
             }
-            if canvas.source != Some(layer.source) {
-                screen.set_source(number, layer.source);
-                canvas.source = Some(layer.source);
-            }
-            let multiplier = (layer.alpha * f64::from(u32::MAX)).round() as u32;
+            let multiplier = (layer.alpha() * f64::from(u32::MAX)).round() as u32;
             if canvas.multiplier != Some(multiplier) {
                 screen.set_alpha(number, multiplier);
                 canvas.multiplier = Some(multiplier);
+                commit = true;
             }
-            opaque |= multiplier == u32::MAX;
-            // cosmic-comp sends a frame callback every refresh only to a surface that shows on
-            // screen. A surface hidden behind opaque ones gets one every 995 ms. The window is
-            // hidden as soon as a keyframe is opaque, so the keyframes carry the callback.
-            screen.request_frame(Surface::Slot(number));
-            screen.commit(number);
+            if commit {
+                screen.commit(number);
+                changed = true;
+            }
         }
-        if !opaque {
-            screen.request_frame(Surface::Window);
-        }
-        self.draw(screen, more)
+        changed
     }
 
-    /// Draws rows of the keyframe the timeline needs next while `more` allows.
-    fn draw<S: Screen<Buffer = B>>(
+    /// Draws rows of the keyframe the timeline needs next while `more` allows, unless the last
+    /// slice was less than [`SLICE_INTERVAL`] ago. It commits nothing.
+    pub fn draw<S: Screen<Buffer = B>>(
         &mut self,
+        time: f64,
         screen: &mut S,
         mut more: impl FnMut() -> bool,
     ) -> io::Result<()> {
-        while self.draw_row(screen)? && more() {}
+        if time < self.next_slice {
+            return Ok(());
+        }
+        let mut drew = false;
+        while self.draw_row(screen)? {
+            drew = true;
+            if !more() {
+                break;
+            }
+        }
+        if drew {
+            self.next_slice = time + SLICE_INTERVAL;
+        }
         Ok(())
     }
 
@@ -218,6 +211,27 @@ impl<B> Stage<B> {
     pub fn draw_first<S: Screen<Buffer = B>>(&mut self, screen: &mut S) -> io::Result<()> {
         while self.timeline.wanted() == Some(0) && self.draw_row(screen)? {}
         Ok(())
+    }
+
+    /// When to call [`Stage::show`] and [`Stage::draw`] again, if nothing arrives from the
+    /// compositor before. `None` means only the compositor can end the wait, with the release
+    /// of a buffer.
+    pub fn next_wake(&self) -> Option<f64> {
+        let time = self.timeline.time();
+        let can_draw = self.job.is_some()
+            || self.timeline.wanted().is_some_and(|index| {
+                let canvas = &self.canvases[slot_of(index)];
+                !canvas.busy && !canvas.attached
+            });
+        let drawing = if can_draw {
+            Some(self.next_slice.max(time))
+        } else {
+            self.timeline.next_drawing().filter(|&at| at > time)
+        };
+        match (self.timeline.next_change(), drawing) {
+            (Some(change), Some(drawing)) => Some(change.min(drawing)),
+            (change, drawing) => change.or(drawing),
+        }
     }
 
     /// Draws one row of the keyframe the timeline needs next and returns whether there was one.
@@ -273,44 +287,22 @@ impl<B> Stage<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FADE_STEPS;
 
-    /// Time between two refreshes of the model's output, and the client's shortest time between
-    /// two frames.
-    const REFRESH: f64 = 1.0 / 30.0;
-    /// How long cosmic-comp 1.11 waits before it sends a frame callback to a surface that does
-    /// not show on screen (`THROTTLE` in its `Common::send_frames`).
-    const THROTTLE: f64 = 0.995;
-    const OPAQUE: u32 = u32::MAX;
-
-    /// The state of a surface that a commit carries.
+    /// The state of a synchronized subsurface that a commit carries.
     #[derive(Clone, Copy, Default)]
     struct State {
         /// A buffer to attach, or `Some(None)` to detach.
         attach: Option<Option<u32>>,
         alpha: Option<u32>,
-        frame: bool,
-    }
-
-    impl State {
-        /// Moves this state into `into`, like a commit does.
-        fn merge_into(&mut self, into: &mut State) {
-            let state = std::mem::take(self);
-            into.attach = state.attach.or(into.attach);
-            into.alpha = state.alpha.or(into.alpha);
-            into.frame |= state.frame;
-        }
     }
 
     #[derive(Default)]
     struct ModelSurface {
         pending: State,
-        /// State of a synchronized subsurface that waits for the window's commit.
+        /// State that waits for the window's commit.
         cached: State,
         buffer: Option<u32>,
-        alpha: Option<u32>,
-        /// A frame callback waits to be sent.
-        frame: bool,
-        last_frame: f64,
     }
 
     /// The parts of cosmic-comp 1.11 and smithay that the stage depends on.
@@ -318,29 +310,27 @@ mod tests {
     /// - A synchronized subsurface's state applies with its parent's commit.
     /// - A buffer is released once another buffer replaces it or the surface detaches it
     ///   (`RendererSurfaceState::update_buffer`).
-    /// - A surface whose element is completely hidden behind opaque regions is not presented and
-    ///   loses its primary scanout output (`OutputDamageTracker` and
-    ///   `PrimaryScanoutOutput::update_from_render_element_states`). It then gets a frame
-    ///   callback only when the last one is [`THROTTLE`] old (`send_frames_surface_tree`).
-    /// - A surface is opaque only at full alpha (`WaylandSurfaceRenderElement::opaque_regions`).
+    /// - Every commit schedules a render of the output (`CompositorHandler::commit`), so the
+    ///   model counts every commit of the window as a repaint.
     #[derive(Default)]
     struct Model {
-        time: f64,
-        window: ModelSurface,
         slots: [ModelSurface; SLOTS],
-        top: usize,
         next_buffer: u32,
         alive: Vec<u32>,
         /// Buffers that were attached at some time.
         shown: Vec<u32>,
         /// Slots whose release events the client has not read yet.
         released: Vec<usize>,
+        /// Times of the window's commits.
+        repaints: Vec<f64>,
+        /// A slot has requests that no commit carries yet.
+        loose: bool,
     }
 
     impl Model {
-        fn commit_window(&mut self) {
-            let window = &mut self.window;
-            window.frame |= std::mem::take(&mut window.pending.frame);
+        fn commit_window(&mut self, time: f64) {
+            assert!(!self.loose, "a request waits for a commit of its slot");
+            self.repaints.push(time);
             for (number, slot) in self.slots.iter_mut().enumerate() {
                 let state = std::mem::take(&mut slot.cached);
                 if let Some(buffer) = state.attach {
@@ -349,40 +339,7 @@ mod tests {
                     }
                     slot.buffer = buffer;
                 }
-                slot.alpha = state.alpha.or(slot.alpha);
-                slot.frame |= state.frame;
             }
-        }
-
-        fn opaque(&self, slot: usize) -> bool {
-            let slot = &self.slots[slot];
-            slot.buffer.is_some() && slot.alpha.unwrap_or(OPAQUE) == OPAQUE
-        }
-
-        /// One refresh of the output. Returns whether a frame callback was sent.
-        fn refresh(&mut self) -> bool {
-            self.time += REFRESH;
-            let below = (self.top + 1) % SLOTS;
-            let hidden = [
-                self.opaque(0) || self.opaque(1),
-                below == 0 && self.opaque(self.top),
-                below == 1 && self.opaque(self.top),
-            ];
-            let mut sent = false;
-            let surfaces = std::iter::once(&mut self.window).chain(&mut self.slots);
-            for (surface, hidden) in surfaces.zip(hidden) {
-                // A surface without a buffer is unmapped and gets no frame callback at all.
-                if surface.buffer.is_none() {
-                    continue;
-                }
-                let overdue = self.time - surface.last_frame >= THROTTLE;
-                if surface.frame && (!hidden || overdue) {
-                    surface.frame = false;
-                    surface.last_frame = self.time;
-                    sent = true;
-                }
-            }
-            sent
         }
 
         fn attached(&self, buffer: u32) -> bool {
@@ -424,68 +381,58 @@ mod tests {
         fn attach(&mut self, slot: usize, buffer: Option<&u32>) {
             self.shown.extend(buffer);
             self.slots[slot].pending.attach = Some(buffer.copied());
+            self.loose = true;
         }
-
-        fn set_source(&mut self, _: usize, _: Source) {}
 
         fn set_alpha(&mut self, slot: usize, multiplier: u32) {
             self.slots[slot].pending.alpha = Some(multiplier);
+            self.loose = true;
         }
 
         fn place_above(&mut self, slot: usize, below: usize) {
             assert_ne!(slot, below);
-            self.top = slot;
-        }
-
-        fn request_frame(&mut self, surface: Surface) {
-            match surface {
-                Surface::Window => self.window.pending.frame = true,
-                Surface::Slot(slot) => self.slots[slot].pending.frame = true,
-            }
         }
 
         fn commit(&mut self, slot: usize) {
             let slot = &mut self.slots[slot];
-            slot.pending.merge_into(&mut slot.cached);
+            let state = std::mem::take(&mut slot.pending);
+            slot.cached.attach = state.attach.or(slot.cached.attach);
+            slot.cached.alpha = state.alpha.or(slot.cached.alpha);
+            self.loose = false;
         }
     }
 
     /// Runs the client's loop against the model for `seconds` and returns the index of the
-    /// keyframe on top. A frame starts only after a frame callback of the frame before, and it
-    /// draws at most 20 rows of the next keyframe.
-    fn run(seconds: f64) -> u64 {
-        let mut model = Model {
-            top: SLOTS - 1,
-            ..Model::default()
-        };
-        model.window.buffer = Some(0);
+    /// keyframe on top and the times of the repaints. The client wakes only when the stage asks
+    /// or a release arrives, commits the window only when the stage says the screen changed,
+    /// and draws at most 20 rows of the next keyframe per slice.
+    fn run(seconds: f64) -> (u64, Vec<f64>) {
+        let mut model = Model::default();
         let mut stage: Stage<u32> = Stage::new(0x5eed, [320, 180]);
-        let mut frame_pending = false;
-        let mut last_frame: Option<f64> = None;
-        while model.time < seconds {
+        let mut time = 0.0;
+        while time < seconds {
             for slot in std::mem::take(&mut model.released) {
                 stage.released(slot);
             }
-            if !frame_pending {
-                let elapsed = last_frame.map_or(0.0, |last| model.time - last);
-                last_frame = Some(model.time);
-                let mut rows = 0;
-                let more = || {
-                    rows += 1;
-                    rows < 20
-                };
-                stage
-                    .frame(elapsed, &mut model, more)
-                    .expect("the model has no errors");
-                model.commit_window();
-                frame_pending = true;
-                stage
-                    .draw_first(&mut model)
-                    .expect("the model has no errors");
+            if stage.show(time, &mut model) {
+                model.commit_window(time);
             }
-            if model.refresh() {
-                frame_pending = false;
+            let mut rows = 0;
+            let more = || {
+                rows += 1;
+                rows < 20
+            };
+            stage
+                .draw(time, &mut model, more)
+                .expect("the model has no errors");
+            stage
+                .draw_first(&mut model)
+                .expect("the model has no errors");
+            if !model.released.is_empty() {
+                continue;
             }
+            let wake = stage.next_wake().expect("the client would sleep for ever");
+            time = time.max(wake);
         }
         let top = stage.timeline().layers().last().expect("a keyframe shows");
         for layer in stage.timeline().layers() {
@@ -495,15 +442,32 @@ mod tests {
                 layer.index
             );
         }
-        top.index
+        (top.index, model.repaints)
     }
 
-    // A keyframe starts every 10 s, so the fifth one is on top after 45 s. With the frame
-    // callback on the window alone, the model sends one a second once the first keyframe is
-    // opaque, each frame moves the timeline by a tenth of a second at most, and the first
-    // keyframe is still on top.
+    // A keyframe starts every 10 s, so the fifth one is on top after 45 s. Each of the five
+    // fades is 30 repaints within a second, and nothing is committed between two fades. A client
+    // that commits on every frame, as it did while the keyframes panned, repaints 300 times in
+    // 10 s.
     #[test]
-    fn keyframes_change_on_time_against_the_compositor() {
-        assert_eq!(run(45.0), 4);
+    fn keyframes_change_on_time_and_nothing_repaints_between_fades() {
+        let (top, repaints) = run(45.0);
+        assert_eq!(top, 4);
+        let mut fades = [0u32; 5];
+        for &time in &repaints {
+            let fade = (time / 10.0).floor();
+            assert!(
+                time - fade * 10.0 < 1.0,
+                "a repaint at {time:.3} s falls between two fades"
+            );
+            fades[fade as usize] += 1;
+        }
+        for (fade, &count) in fades.iter().enumerate() {
+            assert!(
+                (1..=FADE_STEPS).contains(&count),
+                "fade {fade} took {count} repaints"
+            );
+        }
+        assert_eq!(repaints.len() as u32, 5 * FADE_STEPS);
     }
 }

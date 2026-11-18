@@ -1,16 +1,16 @@
-//! Domain-warped keyframes drawn on the CPU, and the timeline that pans, zooms and fades them.
+//! Domain-warped keyframes drawn on the CPU, and the timeline that fades from one to the next.
 //!
 //! Each keyframe is drawn once into its own buffer of at most [`BUFFER_PIXELS`] pixels. The
-//! compositor scales the visible part of each buffer up to the screen, moves it and fades between
-//! buffers, so the client never redraws the screen.
+//! compositor scales each buffer up to the screen and fades between buffers, so the client never
+//! redraws the screen. Between two fades nothing changes and nobody repaints.
 
 mod field;
 mod stage;
 mod timeline;
 
 pub use field::{Look, Raster, SUPERSAMPLE};
-pub use stage::{SLOTS, Screen, Stage, Surface};
-pub use timeline::{Layer, Source, Timeline, keyframe_look};
+pub use stage::{SLOTS, Screen, Stage};
+pub use timeline::{FADE_STEPS, Layer, Timeline, keyframe_look};
 
 /// Buffer length in pixels for a logical length at a fractional scale given in 120ths.
 pub fn physical_size(logical: u32, scale: u32) -> u32 {
@@ -22,23 +22,16 @@ pub fn physical_size(logical: u32, scale: u32) -> u32 {
 /// The time to draw a keyframe grows with this number.
 pub const BUFFER_PIXELS: u32 = 1_500_000;
 
-/// Length of the area a keyframe covers for a physical screen length: 6.5% more, rounded to
-/// even. That is the room the keyframe's pan and zoom need during its life.
-fn covered_size(screen: u32) -> u32 {
-    ((u64::from(screen) * 1065 + 1000) / 2000) as u32 * 2
-}
-
 /// The size of a keyframe buffer for a physical screen size, and the screen pixels per buffer
-/// pixel. The scale is 1 when the area a keyframe covers fits in [`BUFFER_PIXELS`].
+/// pixel along the height. The buffer is the screen itself when that fits in [`BUFFER_PIXELS`].
 pub fn buffer_layout(screen: [u32; 2]) -> ([u32; 2], f64) {
-    let covered = screen.map(covered_size);
-    let pixels = u64::from(covered[0]) * u64::from(covered[1]);
+    let pixels = u64::from(screen[0]) * u64::from(screen[1]);
     if pixels <= u64::from(BUFFER_PIXELS) {
-        return (covered, 1.0);
+        return (screen, 1.0);
     }
-    let scale = (pixels as f64 / f64::from(BUFFER_PIXELS)).sqrt();
-    let size = covered.map(|c| ((f64::from(c) / scale) as u32 / 2 * 2).max(2));
-    (size, scale)
+    let ratio = (pixels as f64 / f64::from(BUFFER_PIXELS)).sqrt();
+    let size = screen.map(|s| ((f64::from(s) / ratio) as u32).max(2));
+    (size, f64::from(screen[1]) / f64::from(size[1]))
 }
 
 /// Seeded SplitMix64 generator.
@@ -79,21 +72,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn buffers_match_the_fractional_scale_and_margin() {
+    fn buffers_match_the_fractional_scale() {
         let screen = [3413, 1440].map(|s| physical_size(s, 180));
         assert_eq!(screen, [5120, 2160]);
         let (size, scale) = buffer_layout(screen);
-        assert_eq!(size, [1884, 794]);
-        assert!(
-            (scale - (12_539_600.0f64 / 1_500_000.0).sqrt()).abs() < 1e-12,
-            "scale {scale}"
-        );
+        assert_eq!(size, [1885, 795]);
+        assert!((scale - 2160.0 / 795.0).abs() < 1e-12, "scale {scale}");
         assert_eq!(
             buffer_layout([1280, 720].map(|s| physical_size(s, 120))),
-            ([1364, 766], 1.0)
+            ([1280, 720], 1.0)
         );
         assert_eq!(physical_size(1281, 150), 1601);
-        assert_eq!(buffer_layout([1601, 810]), ([1706, 862], 1.0));
     }
 
     #[test]
@@ -110,13 +99,12 @@ mod tests {
                 size[0] * size[1] <= BUFFER_PIXELS,
                 "screen {screen:?}: {size:?}"
             );
-            for a in 0..2 {
-                let covered = f64::from(size[a]) * scale;
-                assert!(
-                    covered > f64::from(screen[a]) * 1.055,
-                    "screen {screen:?}: the buffer covers {covered} on axis {a}"
-                );
-            }
+            // The compositor stretches the buffer over the screen, so both axes must scale alike.
+            let across = f64::from(screen[0]) / f64::from(size[0]);
+            assert!(
+                (across / scale - 1.0).abs() < 0.002,
+                "screen {screen:?}: {across} across and {scale} down"
+            );
         }
     }
 }

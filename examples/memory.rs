@@ -147,7 +147,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let (buffer, scale) = buffer_layout(SCREEN);
     let size = buffer.map(|s| s as usize);
-    let timeline = Timeline::new(SEED, SCREEN, buffer, scale);
+    let timeline = Timeline::new(SEED);
     println!(
         "keyframe buffers are {}x{} XRGB8888, {scale:.3} screen pixels per buffer pixel",
         size[0], size[1]
