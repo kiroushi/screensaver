@@ -389,6 +389,11 @@ pub struct Raster {
     next_star: usize,
     kernel: Vec<f32>,
     reach: i32,
+    /// Weights along each axis of the buffer pixels a star is stamped on after the prefilter.
+    stamp: [f32; 3],
+    /// Sum of a stamped star's buffer pixels for a star of brightness 1.
+    stamp_sum: f32,
+    next_stamp: usize,
     light: [Vec<f32>; 3],
     density: Vec<f32>,
     /// Luminance, rim and glow of the row being shaded.
@@ -448,6 +453,22 @@ impl Raster {
         } else {
             Vec::new()
         };
+        // The compositor's bilinear filter spreads a buffer pixel into a tent with a variance of a
+        // sixth of a buffer pixel squared, so a stamped star only carries the variance its
+        // Gaussian has beyond that. A screen pixel centre lies a quarter of a screen pixel from
+        // the star's centre on average along each axis, which lowers the peak of the tent there.
+        // The sum splits that loss evenly between the star's peak and its total light on screen.
+        let pixel_scale = scale / samples as f64;
+        let variance = 0.225 * pixel_scale * pixel_scale - 1.0 / 6.0;
+        let side = if variance > 0.0 {
+            (-0.5 / variance).exp()
+        } else {
+            0.0
+        };
+        let stamp = [side, 1.0, side].map(|w| (w / (1.0 + 2.0 * side)) as f32);
+        let off_centre = 1.0 - 0.25 / (step * samples as f64);
+        let stamp_sum =
+            (0.45 * std::f64::consts::PI * pixel_scale * pixel_scale / off_centre) as f32;
         let reach = (2.0 * scale).ceil() as i32;
         let side = (2 * reach + 1) as usize;
         let kernel = (0..side * side)
@@ -482,6 +503,9 @@ impl Raster {
             next_star: 0,
             kernel,
             reach,
+            stamp,
+            stamp_sum,
+            next_stamp: 0,
             light: std::array::from_fn(|_| vec![0.0; stride]),
             density: vec![0.0; stride],
             factors: std::array::from_fn(|_| vec![0.0; stride]),
@@ -505,6 +529,7 @@ impl Raster {
                 }
                 let prefilter = self.prefilter.as_ref().expect("checked above");
                 prefilter.row(y, &mut self.sums);
+                self.stamp_stars(y);
                 self.next_out += 1;
                 y
             }
@@ -723,9 +748,53 @@ impl Raster {
                     BACKGROUND[channel] * (1.0 - mass) + lit * mass + lit * glow * (1.0 - mass);
             }
         }
-        self.add_stars(y);
+        if self.prefilter.is_some() {
+            self.dim_stars(y);
+        } else {
+            self.add_stars(y);
+        }
         self.next_row += 1;
         Some(y)
+    }
+
+    /// Dims the stars of sample row `y` by the mass they sit on, before they are stamped.
+    fn dim_stars(&mut self, y: usize) {
+        while let Some(star) = self.stars.get_mut(self.next_star)
+            && star.y <= y as i32
+        {
+            star.brightness *= 1.0 - 0.7 * self.density[star.x as usize];
+            self.next_star += 1;
+        }
+    }
+
+    /// Adds the stars to buffer row `y` after the prefilter, which would spread each one over
+    /// three pixels and leave a quarter of its peak. A star goes on the buffer pixel that holds
+    /// its sample. Sharing it between pixels to keep its place within the pixel halves its peak.
+    fn stamp_stars(&mut self, y: usize) {
+        let row = |star: &Star| star.y as usize / SUPERSAMPLE;
+        while self
+            .stars
+            .get(self.next_stamp)
+            .is_some_and(|star| row(star) + 1 < y)
+        {
+            self.next_stamp += 1;
+        }
+        for star in &self.stars[self.next_stamp..] {
+            if row(star) > y + 1 {
+                break;
+            }
+            let vertical = self.stamp[row(star) + 1 - y];
+            let column = star.x as usize / SUPERSAMPLE;
+            for (dx, horizontal) in self.stamp.into_iter().enumerate() {
+                let Some(x) = (column + dx).checked_sub(1).filter(|&x| x < self.out_width) else {
+                    continue;
+                };
+                let weight = star.brightness * self.stamp_sum * vertical * horizontal;
+                for (sums, colour) in self.sums.iter_mut().zip(STAR_COLOUR) {
+                    sums[x] += weight * colour;
+                }
+            }
+        }
     }
 
     fn add_stars(&mut self, y: usize) {
@@ -895,6 +964,99 @@ mod tests {
                 "a streak at {degrees} degrees varies by {modulation:.3} along its length"
             );
         }
+    }
+
+    /// The light the stars add to a patch of a 5120x2160 screen, per screen pixel, in sums of
+    /// the three channel codes. The patch is `size` buffer pixels at `scale` screen pixels per
+    /// buffer pixel, shown through the compositor's bilinear filter.
+    fn star_light(look: Look, size: [usize; 2], scale: f64) -> (Vec<Vec<f64>>, Raster) {
+        const SCREEN_HEIGHT: u32 = 2160;
+        let [width, height] = size;
+        let draw = |stars| Raster::render(look, width, height, SCREEN_HEIGHT, scale, stars);
+        let (with, without) = (draw(true), draw(false));
+        let texel = |x: usize, y: usize| -> f64 {
+            let at = (y * width + x) * 4;
+            (0..3)
+                .map(|c| f64::from(with[at + c]) - f64::from(without[at + c]))
+                .sum()
+        };
+        let taps = |screen: usize, texels: usize| {
+            let t = ((screen as f64 + 0.5) / scale - 0.5).clamp(0.0, (texels - 1) as f64);
+            let first = (t.floor() as usize).min(texels - 2);
+            (first, t - first as f64)
+        };
+        let [columns, rows] = size.map(|s| (s as f64 * scale) as usize);
+        let light = (0..rows)
+            .map(|y| {
+                let (y0, fy) = taps(y, height);
+                (0..columns)
+                    .map(|x| {
+                        let (x0, fx) = taps(x, width);
+                        let top = texel(x0, y0) * (1.0 - fx) + texel(x0 + 1, y0) * fx;
+                        let bottom = texel(x0, y0 + 1) * (1.0 - fx) + texel(x0 + 1, y0 + 1) * fx;
+                        top * (1.0 - fy) + bottom * fy
+                    })
+                    .collect()
+            })
+            .collect();
+        let raster = Raster::new(look, width, height, SCREEN_HEIGHT, scale, true);
+        (light, raster)
+    }
+
+    /// Peak and total of the light within `reach` screen pixels of a point.
+    fn peak_and_total(light: &[Vec<f64>], centre: [f64; 2], reach: f64) -> (f64, f64) {
+        let mut found = (0.0f64, 0.0);
+        for (y, row) in light.iter().enumerate() {
+            for (x, &value) in row.iter().enumerate() {
+                let (dx, dy) = (x as f64 + 0.5 - centre[0], y as f64 + 0.5 - centre[1]);
+                if dx.abs() <= reach && dy.abs() <= reach {
+                    found = (found.0.max(value), found.1 + value);
+                }
+            }
+        }
+        found
+    }
+
+    // At 3.10 screen pixels per buffer pixel the stars of this patch measure peaks from 0.77 to
+    // 1.07 times their full-resolution peaks and totals from 0.81 to 1.25 times. A star that
+    // goes through the prefilter measures a peak of 0.22.
+    #[test]
+    fn stars_are_as_bright_as_at_full_resolution() {
+        const SCALE: f64 = 3.098;
+        const SIZE: [usize; 2] = [256, 128];
+        let look = Look {
+            seed: 4,
+            hue_shift: 0.0,
+        };
+        let (reduced, raster) = star_light(look, SIZE, SCALE);
+        let full_size = SIZE.map(|s| (s as f64 * SCALE) as usize);
+        let (full, _) = star_light(look, full_size, 1.0);
+        let mut measured = 0;
+        for (index, star) in raster.stars.iter().enumerate() {
+            let centre = [star.x, star.y]
+                .map(|sample| (f64::from(sample) + 0.5) * SCALE / SUPERSAMPLE as f64);
+            let alone = raster.stars.iter().enumerate().all(|(other, s)| {
+                other == index || (s.x - star.x).abs().max((s.y - star.y).abs()) > 16
+            });
+            let inside = (0..2).all(|a| centre[a] > 16.0 && centre[a] < full_size[a] as f64 - 16.0);
+            if !alone || !inside {
+                continue;
+            }
+            let (full_peak, full_total) = peak_and_total(&full, centre, 8.0);
+            let (peak, total) = peak_and_total(&reduced, centre, 8.0);
+            // Faint stars are a few codes high, where rounding decides the ratio.
+            if full_peak < 60.0 {
+                continue;
+            }
+            measured += 1;
+            let (peak, total) = (peak / full_peak, total / full_total);
+
+            assert!(
+                (0.6..1.4).contains(&peak) && (0.6..1.4).contains(&total),
+                "star {index}: peak {peak:.2} and total {total:.2} of full resolution"
+            );
+        }
+        assert!(measured >= 5, "only {measured} stars were measured");
     }
 
     // The rarest stop, aqua, is the nearest one for 0.070 of the coloured pixels.
