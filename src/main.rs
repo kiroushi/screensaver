@@ -37,8 +37,8 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 
 const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
 /// Time after which a frame starts no further row of a keyframe, except for the first keyframe,
-/// which is drawn whole. A row takes about a quarter of a millisecond, so no frame spends much
-/// more than 2 ms drawing.
+/// which is drawn whole. A row takes about a tenth of a millisecond, so no frame spends much
+/// more than 1.5 ms drawing.
 const DRAW_BUDGET: Duration = Duration::from_micros(1500);
 const FALLBACK_SIZE: (i32, i32) = (1280, 720);
 const KEY_ESCAPE: u32 = 1;

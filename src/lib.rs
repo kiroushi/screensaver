@@ -15,10 +15,10 @@ pub fn physical_size(logical: u32, scale: u32) -> u32 {
     ((u64::from(logical) * u64::from(scale) + 60) / 120) as u32
 }
 
-/// Most pixels a keyframe buffer holds, which is 5.6 MB of XRGB8888. Two buffers exist while one
+/// Most pixels a keyframe buffer holds, which is 6.0 MB of XRGB8888. Two buffers exist while one
 /// keyframe is drawn and fades in over another, and the rest of the program holds about 4 MB.
 /// The time to draw a keyframe grows with this number.
-pub const BUFFER_PIXELS: u32 = 1_400_000;
+pub const BUFFER_PIXELS: u32 = 1_500_000;
 
 /// Length of the area a keyframe covers for a physical screen length: 6.5% more, rounded to
 /// even. That is the room the keyframe's pan and zoom need during its life.
@@ -81,9 +81,9 @@ mod tests {
         let screen = [3413, 1440].map(|s| physical_size(s, 180));
         assert_eq!(screen, [5120, 2160]);
         let (size, scale) = buffer_layout(screen);
-        assert_eq!(size, [1820, 768]);
+        assert_eq!(size, [1884, 794]);
         assert!(
-            (scale - (12_539_600.0f64 / 1_400_000.0).sqrt()).abs() < 1e-12,
+            (scale - (12_539_600.0f64 / 1_500_000.0).sqrt()).abs() < 1e-12,
             "scale {scale}"
         );
         assert_eq!(
@@ -91,7 +91,7 @@ mod tests {
             ([1364, 766], 1.0)
         );
         assert_eq!(physical_size(1281, 150), 1601);
-        assert_eq!(buffer_layout([1601, 810]).0, [1664, 840]);
+        assert_eq!(buffer_layout([1601, 810]), ([1706, 862], 1.0));
     }
 
     #[test]
