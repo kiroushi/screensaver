@@ -1,74 +1,120 @@
-//! Fullscreen Wayland client that shows flowing colour ribbons and keeps the display awake.
+//! Fullscreen Wayland client that shows domain-warped keyframes and keeps the display awake.
+//!
+//! Each keyframe lives in a shared-memory buffer of its own. A new keyframe replaces the last one
+//! on the window in one commit, and the compositor scales it up to the screen. Between two
+//! keyframes the client commits nothing, so the compositor repaints nothing, and the client
+//! sleeps in `poll`.
 
 use std::error::Error;
 use std::fs::File;
 use std::io::ErrorKind;
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{MemfdFlags, memfd_create};
 use rustix::io::Errno;
-use screensaver::{BUFFER_WIDTH, Renderer, buffer_height};
+use screensaver::{Screen, Stage, physical_size};
 use wayland_client::backend::WaylandError;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_region, wl_registry,
-    wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_region, wl_registry, wl_seat, wl_shm,
+    wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, QueueHandle, WEnum, delegate_noop};
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
+};
 use wayland_protocols::wp::idle_inhibit::zv1::client::{
     zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1,
 };
+use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1;
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
-const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
+/// Longest time the client draws without looking at the compositor's messages. A keyframe takes
+/// several such slices one after another, with no sleep between them.
+const DRAW_BUDGET: Duration = Duration::from_millis(10);
 const FALLBACK_SIZE: (i32, i32) = (1280, 720);
 const KEY_ESCAPE: u32 = 1;
+/// Fractional scale in 120ths when the compositor does not send one.
+const UNSCALED: u32 = 120;
 
-struct Slot {
-    buffer: wl_buffer::WlBuffer,
-    offset: u64,
-    busy: bool,
-}
-
-/// Two XRGB8888 buffers in one shared-memory pool, written with pwrite.
-struct Buffers {
+/// The memory of one keyframe and the buffer that shows it to the compositor.
+struct Store {
     file: File,
-    slots: [Slot; 2],
+    buffer: wl_buffer::WlBuffer,
+    /// Bytes per row.
+    stride: usize,
 }
 
-impl Buffers {
-    fn new(shm: &wl_shm::WlShm, height: usize, qh: &QueueHandle<App>) -> std::io::Result<Self> {
-        let frame_len = BUFFER_WIDTH * height * 4;
-        let file = File::from(memfd_create("screensaver", MemfdFlags::CLOEXEC)?);
-        file.set_len((frame_len * 2) as u64)?;
-        let pool = shm.create_pool(file.as_fd(), (frame_len * 2) as i32, qh, ());
-        let slots = std::array::from_fn(|i| Slot {
-            buffer: pool.create_buffer(
-                (i * frame_len) as i32,
-                BUFFER_WIDTH as i32,
-                height as i32,
-                (BUFFER_WIDTH * 4) as i32,
-                wl_shm::Format::Xrgb8888,
-                qh,
-                (),
-            ),
-            offset: (i * frame_len) as u64,
-            busy: false,
-        });
-        pool.destroy();
-        Ok(Self { file, slots })
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.buffer.destroy();
     }
 }
 
-impl Drop for Buffers {
-    fn drop(&mut self) {
-        for slot in &self.slots {
-            slot.buffer.destroy();
-        }
+/// The stage of one logical size and scale, and the instant its timeline counts from.
+struct Sized {
+    size: (i32, i32),
+    scale: u32,
+    stage: Stage<Store>,
+    epoch: Instant,
+}
+
+/// The window as the stage addresses it.
+struct Window<'a> {
+    surface: &'a wl_surface::WlSurface,
+    shm: &'a wl_shm::WlShm,
+    qh: &'a QueueHandle<App>,
+}
+
+impl Screen for Window<'_> {
+    type Buffer = Store;
+
+    fn create_buffer(
+        &mut self,
+        keyframe: u64,
+        width: usize,
+        height: usize,
+    ) -> std::io::Result<Store> {
+        let length = width * height * 4;
+        let file = File::from(memfd_create("screensaver", MemfdFlags::CLOEXEC)?);
+        file.set_len(length as u64)?;
+        let pool = self
+            .shm
+            .create_pool(file.as_fd(), length as i32, self.qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            width as i32,
+            height as i32,
+            (width * 4) as i32,
+            wl_shm::Format::Xrgb8888,
+            self.qh,
+            keyframe,
+        );
+        pool.destroy();
+        Ok(Store {
+            file,
+            buffer,
+            stride: width * 4,
+        })
+    }
+
+    fn write_row(&mut self, buffer: &Store, row: usize, pixels: &[u8]) -> std::io::Result<()> {
+        buffer
+            .file
+            .write_all_at(pixels, (row * buffer.stride) as u64)
+    }
+
+    fn destroy_buffer(&mut self, buffer: Store) {
+        drop(buffer);
+    }
+
+    fn attach(&mut self, buffer: &Store) {
+        self.surface.attach(Some(&buffer.buffer), 0, 0);
+        self.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
     }
 }
 
@@ -78,57 +124,99 @@ struct App {
     shm: wl_shm::WlShm,
     surface: wl_surface::WlSurface,
     viewport: wp_viewport::WpViewport,
+    xdg_surface: xdg_surface::XdgSurface,
+    /// One opaque black pixel that the viewport stretches over the whole window until the first
+    /// keyframe is drawn.
+    black: wl_buffer::WlBuffer,
+    black_attached: bool,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     /// Size from the latest toplevel configure, if the compositor chose one.
     requested_size: Option<(i32, i32)>,
     size: Option<(i32, i32)>,
-    buffers: Option<Buffers>,
-    renderer: Renderer,
-    frame: Vec<u8>,
-    frame_pending: bool,
+    /// Preferred fractional scale in 120ths.
+    scale: Option<u32>,
+    stage: Option<Sized>,
+    seed: u64,
+    /// The window has state that waits for a commit.
     redraw: bool,
 }
 
 impl App {
-    fn configure(&mut self, qh: &QueueHandle<Self>) -> std::io::Result<()> {
+    fn configure(&mut self, qh: &QueueHandle<Self>) {
         let (width, height) = self.requested_size.or(self.size).unwrap_or(FALLBACK_SIZE);
         self.viewport.set_destination(width, height);
         let region = self.compositor.create_region(qh, ());
         region.add(0, 0, width, height);
         self.surface.set_opaque_region(Some(&region));
         region.destroy();
-
-        let rows = buffer_height(width as u32, height as u32);
-        if self.buffers.is_none() || rows != self.renderer.height() {
-            self.buffers = None;
-            self.buffers = Some(Buffers::new(&self.shm, rows, qh)?);
-            self.renderer = Renderer::new(BUFFER_WIDTH, rows);
-            self.frame = vec![0; self.renderer.frame_len()];
+        self.xdg_surface.set_window_geometry(0, 0, width, height);
+        if !self.black_attached {
+            self.surface.attach(Some(&self.black), 0, 0);
+            self.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+            self.black_attached = true;
         }
         self.size = Some((width, height));
         self.redraw = true;
-        Ok(())
     }
 
-    /// Renders and commits a frame. Returns false when no buffer is free.
-    fn draw(&mut self, time: f64, qh: &QueueHandle<Self>) -> std::io::Result<bool> {
-        let Some(buffers) = &mut self.buffers else {
-            return Ok(false);
+    /// Builds a new stage once the size and scale are known, and again whenever either changes.
+    fn prepare_stage(&mut self) {
+        let (Some(size), Some(scale)) = (self.size, self.scale) else {
+            return;
         };
-        let Some(slot) = buffers.slots.iter_mut().find(|slot| !slot.busy) else {
-            return Ok(false);
+        if self
+            .stage
+            .as_ref()
+            .is_some_and(|stage| stage.size == size && stage.scale == scale)
+        {
+            return;
+        }
+        if self.stage.is_some() {
+            // The window goes back to black before the keyframe on it is destroyed.
+            self.surface.attach(Some(&self.black), 0, 0);
+            self.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+            self.surface.commit();
+        }
+        let screen = [size.0, size.1].map(|s| physical_size(s.max(1) as u32, scale));
+        self.stage = Some(Sized {
+            size,
+            scale,
+            stage: Stage::new(self.seed, screen),
+            epoch: Instant::now(),
+        });
+    }
+
+    /// Does what the stage has due, and commits the window only if a new keyframe was attached
+    /// or the window was configured. Returns how long the client may sleep, or `None` if only
+    /// the compositor can wake it.
+    fn update(&mut self, qh: &QueueHandle<Self>) -> std::io::Result<Option<Duration>> {
+        let Some(mut sized) = self.stage.take() else {
+            if std::mem::take(&mut self.redraw) {
+                self.surface.commit();
+            }
+            return Ok(None);
         };
-        self.renderer.render(time, &mut self.frame);
-        buffers.file.write_all_at(&self.frame, slot.offset)?;
-        self.surface.attach(Some(&slot.buffer), 0, 0);
-        self.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-        self.surface.frame(qh, ());
-        self.surface.commit();
-        slot.busy = true;
-        self.frame_pending = true;
-        self.redraw = false;
-        Ok(true)
+        let now = Instant::now();
+        let time = (now - sized.epoch).as_secs_f64();
+        let mut window = Window {
+            surface: &self.surface,
+            shm: &self.shm,
+            qh,
+        };
+        let deadline = now + DRAW_BUDGET;
+        let result = sized
+            .stage
+            .wake(time, &mut window, || Instant::now() < deadline);
+        let sleep = sized
+            .stage
+            .next_wake(time)
+            .map(|wake| Duration::from_secs_f64((wake - time).max(0.0)));
+        self.stage = Some(sized);
+        if result? | std::mem::take(&mut self.redraw) {
+            self.surface.commit();
+        }
+        Ok(sleep)
     }
 }
 
@@ -141,6 +229,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let shm: wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let wm_base: xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
     let viewporter: wp_viewporter::WpViewporter = globals.bind(&qh, 1..=1, ())?;
+    let pixels: wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
     let _seat: Option<wl_seat::WlSeat> = globals.bind(&qh, 1..=7, ()).ok();
 
     let surface = compositor.create_surface(&qh, ());
@@ -150,7 +240,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     toplevel.set_title("Screensaver".into());
     toplevel.set_app_id("screensaver".into());
     toplevel.set_fullscreen(None);
+    let black = pixels.create_u32_rgba_buffer(0, 0, 0, u32::MAX, &qh, ());
 
+    let scale = match globals
+        .bind::<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, _, _>(&qh, 1..=1, ())
+    {
+        Ok(manager) => {
+            manager.get_fractional_scale(&surface, &qh, ());
+            None
+        }
+        Err(_) => Some(UNSCALED),
+    };
     let _inhibitor = match globals
         .bind::<zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1, _, _>(&qh, 1..=1, ())
     {
@@ -164,54 +264,45 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     surface.commit();
 
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
     let mut app = App {
         running: true,
         compositor,
         shm,
         surface,
         viewport,
+        xdg_surface,
+        black,
+        black_attached: false,
         keyboard: None,
         pointer: None,
         requested_size: None,
         size: None,
-        buffers: None,
-        renderer: Renderer::new(BUFFER_WIDTH, 0),
-        frame: Vec::new(),
-        frame_pending: false,
+        scale,
+        stage: None,
+        seed,
         redraw: false,
     };
 
-    let start = Instant::now();
-    let mut next_frame = start;
     while app.running {
         queue.dispatch_pending(&mut app)?;
         if !app.running {
             break;
         }
-
-        let now = Instant::now();
-        let mut timeout = None;
-        if app.buffers.is_some() && (app.redraw || !app.frame_pending) {
-            if app.redraw || now >= next_frame {
-                if app.draw(start.elapsed().as_secs_f64(), &qh)? {
-                    let scheduled = next_frame + FRAME_INTERVAL;
-                    next_frame = if scheduled > now {
-                        scheduled
-                    } else {
-                        now + FRAME_INTERVAL
-                    };
-                }
-            } else {
-                timeout = Some(next_frame - now);
-            }
-        }
+        app.prepare_stage();
+        let timeout = if app.size.is_some() {
+            app.update(&qh)?
+        } else {
+            None
+        };
 
         let flush_blocked = match conn.flush() {
             Ok(()) => false,
             Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => true,
             Err(e) => return Err(e.into()),
         };
-
         let Some(guard) = queue.prepare_read() else {
             continue;
         };
@@ -280,10 +371,7 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for App {
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
             xdg_surface.ack_configure(serial);
-            if let Err(error) = app.configure(qh) {
-                eprintln!("screensaver: cannot create the frame buffers: {error}");
-                app.running = false;
-            }
+            app.configure(qh);
         }
     }
 }
@@ -307,35 +395,34 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for App {
     }
 }
 
-impl Dispatch<wl_callback::WlCallback, ()> for App {
+impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for App {
     fn event(
         app: &mut Self,
-        _: &wl_callback::WlCallback,
-        event: wl_callback::Event,
+        _: &wp_fractional_scale_v1::WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_callback::Event::Done { .. } = event {
-            app.frame_pending = false;
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            app.scale = Some(scale);
         }
     }
 }
 
-impl Dispatch<wl_buffer::WlBuffer, ()> for App {
+impl Dispatch<wl_buffer::WlBuffer, u64> for App {
     fn event(
         app: &mut Self,
-        buffer: &wl_buffer::WlBuffer,
+        _: &wl_buffer::WlBuffer,
         event: wl_buffer::Event,
-        _: &(),
+        keyframe: &u64,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         if let wl_buffer::Event::Release = event
-            && let Some(buffers) = &mut app.buffers
-            && let Some(slot) = buffers.slots.iter_mut().find(|slot| slot.buffer == *buffer)
+            && let Some(sized) = &mut app.stage
         {
-            slot.busy = false;
+            sized.stage.released(*keyframe);
         }
     }
 }
@@ -403,7 +490,10 @@ delegate_noop!(App: ignore wl_surface::WlSurface);
 delegate_noop!(App: ignore wl_shm::WlShm);
 delegate_noop!(App: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(App: ignore wl_region::WlRegion);
+delegate_noop!(App: ignore wl_buffer::WlBuffer);
 delegate_noop!(App: wp_viewporter::WpViewporter);
 delegate_noop!(App: wp_viewport::WpViewport);
+delegate_noop!(App: wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1);
+delegate_noop!(App: wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
 delegate_noop!(App: zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1);
 delegate_noop!(App: zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1);

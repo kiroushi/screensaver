@@ -1,37 +1,65 @@
-A fullscreen Wayland screensaver for COSMIC that renders flowing colour ribbons on the CPU and keeps an OLED display awake through idle-inhibit, while costing almost nothing next to background benchmarks.
+A fullscreen Wayland screensaver for COSMIC that draws domain-warped keyframes on the CPU into buffers of at most 6.0 MB, lets the compositor scale them, replaces one with the next in a single commit every 10 s, leaves the screen untouched in between, and keeps an OLED display awake through idle-inhibit, while costing almost nothing next to background benchmarks.
 
 ## Build and test
 
 ```sh
-cargo build --release                                  # the stripped binary must stay under 1 MB
-cargo test --lib                                       # renderer tests: wear, motion, look
+cargo build --release                                    # the stripped binary must stay under 1 MB; .cargo/config.toml targets x86-64-v3
+cargo test --lib                                         # field, timeline and stage tests: colour, wear, repaints, buffers
 cargo clippy --all-targets -- -W clippy::all
-cargo run --release --example bench                    # milliseconds per frame at 320x135
-cargo run --release --example snapshot -- 45 out.ppm   # 1920x810 bilinear preview of the frame at 45 s
-make install                                           # binary, desktop entry and icon into ~/.local
+cargo run --release --example bench                      # seconds to draw one 1885x795 keyframe, and the slowest row
+cargo run --release --example memory                     # peak memory of the whole program at 5120x2160, without showing anything
+cargo run --release --example keyframe -- 4 out.ppm      # one 1920x810 keyframe with no hue shift; NO_STARS=1 leaves out the stars; a scale after the size draws the reduced buffer
+cargo run --release --example compose -- 12 out.ppm      # the 5120x2160 screen at 12 s, which is the second keyframe scaled up like the compositor scales it
+make install                                             # binary, desktop entry and icon into ~/.local
 ```
 
-Zero warnings policy. The release build and clippy must be clean.
+Zero warnings policy. The release build and clippy must be clean. The debug `cargo test --lib` takes about 10 s, most of it in one six-hour wear simulation that two tests share.
 
 ## Architecture
 
 | File | Purpose |
 |------|---------|
-| `src/lib.rs` | Renderer that turns a time into one XRGB8888 frame, plus the burn-in and motion tests. |
-| `src/main.rs` | Wayland client: fullscreen toplevel, shared-memory double buffer, viewport scaling, idle inhibitor, frame pacing and Esc. |
-| `examples/` | The bench and the snapshot tools used to tune speed and look. |
+| `src/lib.rs` | Seeded PRNG, the screen size for a fractional scale, and the buffer size and scale that fit the pixel budget. |
+| `src/field.rs` | Inigo Quilez's nested domain warping (iquilezles.org/articles/warp): hash, gradient noise, fBm, the warp grid, shading, stars, and the raster that draws a keyframe row by row into XRGB8888, with a prefilter over 2x2 samples per pixel when the buffer is smaller than the screen. Coloured share, palette and streak beading tests. |
+| `src/timeline.rs` | Each keyframe's look from its index, and when the next one is due. Grid, wear and blind-spot tests. |
+| `src/stage.rs` | The buffer on screen, the one that left it and the keyframe being drawn. It talks to the compositor through the `Screen` trait. Its test drives it against a model of cosmic-comp and counts the repaints, the sleeps and the buffers alive. |
+| `src/main.rs` | Wayland client: one fullscreen toplevel with a viewport, a black single-pixel buffer until the first keyframe, the `Screen` implementation with one memfd and `wl_buffer` per keyframe, idle inhibitor, the `poll` loop that sleeps until the stage's next wake, and Esc. |
+| `examples/` | The bench, memory, keyframe and compose tools used to check speed, memory and look. |
 | `screensaver.desktop`, `screensaver.svg`, `Makefile` | Launcher entry, icon and install. |
 
 ## Key technical details
 
-- The buffer is 320 px wide and the compositor stretches it to the screen through `wp_viewport`. cosmic-comp filters it linearly, which produces the soft look. Never upscale on the CPU.
+- The look is Inigo Quilez's nested domain warping from his article at https://iquilezles.org/articles/warp/: `f(p) = fbm(p + K*r)`, `r = fbm2(p + K*q)` and `q = fbm2(p)`. It is a port of a Python reference that was tuned against the user's screenshots. The hash, noise, fBm, warp offsets, palette, shading, rim, glow and stars match that reference. Do not retune them or add shapes.
+- One field unit is the screen height divided by 0.8, in physical pixels, so the look is the same at every resolution and buffer scale. Each keyframe adds a hue shift in `0..2`, applied as a triangle wave on the normalized hue before the palette lookup.
+- The whole program must stay under 20 MB at its peak. `cargo run --release --example memory` measures 9.6 MB at 5120x2160 between keyframes and 15.6 MB while the next keyframe is drawn, which is about 50 ms of every 10 s plus the moment until the compositor releases the old buffer. The parts are 6.0 MB per keyframe buffer, 3.0 MB of binary and shared libraries and 0.6 MB of heap. The program writes keyframes with `pwrite` and never maps them, so their pages are missing from its resident set and the example adds them.
+- A keyframe covers exactly the screen, and the compositor stretches its buffer over it. The buffer holds at most `BUFFER_PIXELS`, 1.5 million. The time to draw a keyframe grows with that number, so it is set by the drawing time and not by the memory. At 5120x2160 the buffer is 1885x795 and one buffer pixel spans 2.72 screen pixels. A screen that fits the budget gets one buffer pixel per screen pixel.
+- The format is XRGB8888 because cosmic-comp 1.11 advertises only ARGB8888, XRGB8888, ABGR8888 and XBGR8888 on `wl_shm`. A format it does not advertise is a fatal `invalid_format` error. RGB565 would hold twice the pixels in the same bytes and look sharper, so check the advertised formats again when cosmic-comp changes.
+- cosmic-comp scales surfaces with `GL_LINEAR` in both directions and has no mipmaps (smithay's `GlesRenderer` defaults, which cosmic-comp does not change). A hard edge in the buffer becomes a ramp one buffer pixel wide on screen.
+- When the buffer is smaller than the area it covers, the keyframe is supersampled: the shading is evaluated twice per buffer pixel along each axis. A buffer pixel is a weighted sum of 6x6 samples with the weights `(1, 3, 5, 5, 3, 1) / 18` along each axis, which is a tent three buffer pixels wide. The samples are shared between neighbouring pixels.
+- The prefilter would spread a star over three buffer pixels and leave 0.22 of its peak, so stars skip it. Each star is stamped on the buffer pixel that holds its sample, after the prefilter, dimmed by the mass at its sample. The bilinear filter turns one buffer pixel into a tent as wide as the star's Gaussian at full resolution. Over 105 stars the peak on screen measures 0.96 of the full-resolution peak at the median and the total light 1.08. Sharing a star between four pixels to keep its place within the pixel leaves 0.56 of its peak. `stars_are_as_bright_as_at_full_resolution` guards the peak and the total.
+- The compositor's bilinear filter turns detail about one buffer pixel wide into beads along diagonal streaks. `a_thin_diagonal_streak_has_no_beads` measures the brightness variation along a synthetic streak. The tent measures 0.17, the mean of a pixel's own 2x2 samples measures 0.38 and shows beads, and `(1, 3, 3, 1) / 8` measures 0.27 and still shows them faintly. A tent four pixels wide measures 0.12 but widens an edge from 5.9 to 7.5 screen pixels. One sample per pixel leaves stairs on the mass edges, and a least-squares fit to the bilinear filter draws stairs along diagonal streaks.
+- Each keyframe has its own memfd and `wl_buffer`. They are created when its drawing starts, at the moment the keyframe is due. When it is drawn it replaces the last buffer on the window. The last buffer is destroyed as soon as the compositor releases it, and no drawing starts before that, so there are never three.
+- Nothing on screen changes between two keyframes. The client commits nothing there and asks for no frame callbacks, so cosmic-comp does not repaint and the GPU stays idle. Every commit makes cosmic-comp schedule a render, even one that changes nothing, and a live run measured 0.83 ms of compositor CPU per repaint. Do not add fades, pan, zoom or any other motion. `each_keyframe_costs_one_repaint_and_nothing_repaints_in_between` counts the commits against a model of the compositor.
+- A keyframe costs one commit: the attach of its buffer in place of the last one. cosmic-comp scales it on the GPU it already uses. Never redraw the screen on the CPU.
 - The program has no GPU context on purpose. It must stay light while GPU benchmarks run, so keep rendering on `wl_shm`.
-- Frames are paced at 30 fps by frame callbacks plus a deadline. When the compositor stops sending callbacks (window hidden, screen off), the loop sleeps in `poll`.
-- Time stays in `f64`, and every phase is reduced with `rem_euclid` before it reaches the `f32` pixel loop. Without that, motion stutters after a few days.
-- Every spatial frequency is a whole number of turns per torus period, so the drift wraps without a seam. New terms must keep integral frequencies.
-- Nothing may be anchored to screen space, because the user runs it on an OLED panel. Phase rates share the sign of the drift, since opposite signs leave lasting bright or dark patches.
-- `every_region_wears_evenly` guards burn-in. A 10% corner vignette fails it. Fix the renderer instead of loosening its bound.
-- The pixel loop must auto-vectorize on baseline x86-64. That is why `sin_turns` has no branches, `channel_byte` uses a bit trick instead of a float-to-integer cast, and no `target-cpu` is set.
+- A new keyframe is due every 10 s. The client wakes then, draws it in about 50 ms and shows it with one commit, so it appears that much after it is due. The next one is due 10 s after the due time and not after the appearance, so the delay does not add up. The first keyframe replaces the black window the same way.
+- The timeline runs on the monotonic clock. The client wakes twice per keyframe: at the due time, and when the compositor releases the old buffer a moment later. While it draws it looks at the compositor's messages every 10 ms without sleeping.
+- The warp vectors `q` and `r` are evaluated at nodes and the samples between lie on the cubic through the four nearest nodes. Halfway that is the midpoint `(-1, 9, 9, -1) / 16`. A keyframe drawn one sample per screen pixel has a node at every other row and column, like the reference. A wider grid fails the parity check against the reference at 480x203, and bilinear interpolation does too. That spacing is 2/203 of the screen height, which is 21 screen pixels at 2160. A supersampled keyframe therefore puts a node at every eighth sample, 12 screen pixels apart.
+- A supersampled keyframe draws `f` and the hue only at the buffer pixels, which are every other sample of every other row, and takes the cubic midpoint between them. Only the shading runs at every sample: the threshold, rim, glow, gradient and palette. `f` and the hue are smooth at that spacing, and the threshold is what needs the extra samples. The finest octave has a lattice cell of 13 samples before the warp. Where the warp squeezes the field twice, the midpoint misses that octave by 0.0003, against 0.012 for half the width of a mass edge.
+- The first four octaves of `f` are drawn at every other buffer pixel, with the same midpoint. Octave 3 has a lattice cell of 211 samples before the warp. Where the warp squeezes the field eight times, the midpoint misses it by 0.0002.
+- Together that is 5 noise evaluations per buffer pixel for `f`: 4 octaves at a quarter of the pixels and 4 at every pixel. Drawing every octave at every sample would be 32. These approximations add 1.5% to the mean error against a full-resolution render, and `BUFFER_PIXELS` is 7% larger than it would otherwise be to make up for it. Measure that error again before changing either.
+- The supersampled keyframe computes its noise a whole row at a time in `fbm_row`, with the gradient direction of each hash from a polynomial in `direction` instead of the table. A row-long loop with no lookup compiles to vector code at the full register width, and loops over 8 lanes do not. `computed_directions_match_the_table` holds the polynomial to the table within 1e-6. A keyframe drawn one sample per screen pixel still uses the table and the 8-lane path, and is bit-identical to the reference port.
+- The colour of a supersampled keyframe is computed once per buffer pixel, from the hue at the pixel, and both samples of the pixel share it. The hue varies over hundreds of pixels, and the measured error against a full-resolution render is the same to four digits as with a colour per sample.
+- Costs that turned out not to be arithmetic: the noise loop for one corner was a chain of about 60 cycles per step, so the processor worked on only three steps at once. Hashing in a loop of its own took a keyframe from 0.070 s to 0.062 s. A copy with a computed index per element kept the prefilter's row pass in scalar code, and a plain copy took it from 11 ms to 3 ms.
+- What cutting further costs on screen, measured as the largest rise in mean or rms error over two seeds and three spots: `BUFFER_PIXELS` at 1.3 million saves 13% of the time for 6.6% more error, 1.1 million saves 27% for 14%, and 0.9 million saves 40% for 24%. `LOW_OCTAVES` at 5 saves 9% for 4.4%, at 6 saves 13% for 9.5%, and at 8 saves 24% for 17%. Evaluating the shading or the fine octaves only near the mass edges saves under 2 ms, because a sample already costs about as much as the interpolation that would replace it.
+- The shading needs the gradient of `f`, so the raster computes one row ahead and carries it to the next band. Bands are single buffer rows. Drawing commits nothing, and the buffer is not attached until it is complete. At 5120x2160 a keyframe takes about 0.047 s of CPU. At one keyframe every 10 s that is 0.47% of one core, and the one repaint adds under 0.01%.
+- In the 8-lane path, when all 8 lanes of a noise call fall in the same lattice cell, the corner gradients are looked up once. The result is bit-identical to the per-lane path.
+- The build targets x86-64-v3 through `.cargo/config.toml`, so the binary needs a CPU with AVX2 (Intel Haswell or AMD Excavator and later). That alone took a keyframe from 0.18 s to 0.14 s. Every per-pixel loop works on chunks of 8 lanes or on whole rows so it auto-vectorizes. That is why `split` and `channel_byte` use bit tricks instead of a floor and a cast, `direction` applies its quadrant with bit masks instead of branches, and the gradient table index is masked at the lookup. A table of the 65536 gradient directions replaces `cos` and `sin` in the 8-lane path.
+- `xdg_surface.set_window_geometry` is sent on every configure.
+- The client asks for no frame callbacks. cosmic-comp sends a frame callback every refresh only to a surface that shows on screen, and one every 995 ms to a surface completely hidden behind opaque ones (`THROTTLE` in `Common::send_frames`). When the keyframes were opaque subsurfaces the window was hidden behind them, so a callback on the window once made the show run at one frame a second. Keyframes follow the clock instead.
+- cosmic-comp keeps an attached buffer until another buffer replaces it or the surface detaches it, and only then sends `wl_buffer.release`. A buffer is written only before its first attach, and it is destroyed only after its release.
+- Between wakes the loop sleeps in `poll` on the Wayland socket, so Esc and the compositor are answered at once.
+- Nothing may be anchored to screen space, because the user runs it on an OLED panel. `every_cell_wears_evenly` and `no_cell_stays_dark_for_long` guard burn-in. Every keyframe has its own seed, so over time each cell sees every colour and the masses in different places. Giving every keyframe the same seed fails both. Fix the timeline instead of loosening their bounds.
 - cosmic-comp honours the idle inhibitor only while the surface is visible on an output.
 - Esc is evdev keycode 1. There is no xkbcommon.
 

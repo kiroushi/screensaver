@@ -1,8 +1,10 @@
 # screensaver
 
-A fullscreen screensaver for the COSMIC desktop that shows slowly flowing colour ribbons and keeps the display awake while it is open. The ribbons drift across the whole screen and keep changing hue, so an OLED panel wears evenly.
+A fullscreen screensaver for the COSMIC desktop that shows swirling, marbled colour fields and keeps the display awake while it is open. Every 10 seconds a new image with its own colour balance replaces the last one, so an OLED panel wears evenly. In between the picture is still and costs the compositor and the GPU nothing.
 
 ## Building
+
+The build targets x86-64-v3, so the binary needs a CPU with AVX2: Intel Haswell (2013), AMD Excavator (2015) or later.
 
 ```sh
 cargo build --release
